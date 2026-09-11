@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+          sudo apt-get install -y libsrt-openssl-dev || sudo apt-get install -y libsrt-dev || true
+      - name: Configure
+        run: cmake -S . -B build -DNANOMPX_WITH_SRT=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: cd build && ctest --output-on-failure

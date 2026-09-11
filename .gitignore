@@ -1,0 +1,13 @@
+/build/
+/cmake-build-*/
+*.o
+*.a
+*.so
+.DS_Store
+/.idea/
+/.vscode/
+
+# Local scratch (keep committed fixtures under tests/vectors/)
+/*.nmpx
+/*.s24
+/roundtrip.*
