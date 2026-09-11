@@ -2,11 +2,16 @@
 
 Thank you for helping build an open MPX-over-IP codec other vendors can use.
 
+Project home: [https://www.kvarta.net](https://www.kvarta.net)
+
+Much of this codebase was drafted with AI coding tools under human direction. When
+contributing, prefer clear, reviewable changes and keep protocol docs in sync.
+
 ## Ground rules
 
 - Keep the **wire protocol** documented in `docs/PROTOCOL.md` in sync with code changes.
 - Do not break PCM bit-exact roundtrip without a protocol version bump.
-- New compressed rates should be new **profile IDs** (keep L/M/S stable).
+- New compressed profiles should use new **profile IDs** (keep L/M/S stable).
 - Prefer portable C99; avoid kunix or other proprietary dependencies.
 - All source files should carry `SPDX-License-Identifier: MIT`.
 

@@ -4,6 +4,7 @@
 (including stereo pilot and RDS) for STL distribution, with optional SRT transport and
 GPS/1PPS SFN synchronization.
 
+- Project site: [www.kvarta.net](https://www.kvarta.net)
 - License: **MIT**
 - Sample rate: **192 kHz / 24-bit**
 - Modes: **PCM** (reference quality) and **COMPRESSED** profiles **L / M / S**
@@ -11,6 +12,13 @@ GPS/1PPS SFN synchronization.
 
 NanoMPX is inspired by the problem space of products like MicroMPX, but it is an
 **independent** open protocol and implementation (not interoperable with Thimeo MicroMPX).
+
+## Project / attribution
+
+NanoMPX is developed by **[Kvarta](https://www.kvarta.net)**. Most of the code in this
+repository was **produced with AI coding assistants**, then reviewed, tested, and
+directed by humans. Treat it like any other open-source C library: verify behavior for
+your use case before production deployment.
 
 ## Build
 

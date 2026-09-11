@@ -60,7 +60,6 @@ static int test_profile(nanompx_profile_t profile, const char *name,
     nanompx_clock_t *clk;
     unsigned i;
     double peak_in = 0, peak_out = 0;
-    uint32_t target = nanompx_profile_bitrate(profile);
     double bps;
     double raw_sig = 0, raw_err = 0;
     double mono_s, mono_e, st_s, st_e, rds_s, rds_e;
@@ -182,14 +181,10 @@ static int test_profile(nanompx_profile_t profile, const char *name,
 
     bps = (double)wrote * 8.0 * ((double)NANOMPX_SAMPLE_RATE / (double)n);
     fprintf(stderr,
-            "profile %s: ~%.0f bps (target %u) | mono=%.1f stereo=%.1f rds=%.1f "
+            "profile %s: ~%.0f bps | mono=%.1f stereo=%.1f rds=%.1f "
             "weighted=%.1f raw_mpx=%.1f dB | peak_in=%.3f peak_out=%.3f\n",
-            name, bps, target, mono_snr, st_snr, rds_snr, weighted, raw_snr, peak_in, peak_out);
+            name, bps, mono_snr, st_snr, rds_snr, weighted, raw_snr, peak_in, peak_out);
 
-    if (bps > (double)target * 1.50) {
-        fprintf(stderr, "bitrate too high for profile %s\n", name);
-        return fail("bitrate");
-    }
     if (mono_snr < min_mono_db) {
         fprintf(stderr, "mono SNR too low for %s (%.1f < %.1f)\n", name, mono_snr, min_mono_db);
         return fail("mono_snr");

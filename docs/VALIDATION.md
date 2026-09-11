@@ -11,7 +11,7 @@ cd build && ctest --output-on-failure
 |------|--------|
 | `test_roundtrip` | PCM encode/decode bit-exact |
 | `test_clock_sfn` | SFN delay gating + GPS inject lock |
-| `test_compressed` | L/M/S band-weighted mono/stereo SNR, bitrate, no overshoots |
+| `test_compressed` | L/M/S band-weighted mono/stereo SNR, no overshoots |
 
 ## Interop vectors
 

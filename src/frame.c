@@ -130,20 +130,6 @@ int nanompx_packet_validate(const uint8_t *packet, size_t packet_len)
     return NANOMPX_OK;
 }
 
-uint32_t nanompx_profile_bitrate(nanompx_profile_t profile)
-{
-    switch (profile) {
-    case NANOMPX_PROFILE_L:
-        return 1600000;
-    case NANOMPX_PROFILE_M:
-        return 960000;
-    case NANOMPX_PROFILE_S:
-        return 640000;
-    default:
-        return 0;
-    }
-}
-
 const char *nanompx_strerror(int err)
 {
     switch (err) {

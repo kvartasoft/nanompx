@@ -53,8 +53,7 @@ Receivers **must** drop packets with bad magic, unsupported version, or bad `hdr
 ### Mode 0 — PCM
 
 Payload is packed s24le mono samples. Length must be a multiple of 3.
-
-Approximate bitrate: `192000 × 24 ≈ 4.608 Mbit/s` plus header overhead.
+Uncompressed payload is 3 bytes per sample (plus packet headers).
 
 ### Mode 1 — COMPRESSED
 
@@ -90,11 +89,13 @@ Processing model:
 
 #### Profiles (reference bit allocation)
 
-| Profile | ID | Target | Mono | Stereo | RDS | Typical payload |
-|---------|----|--------|------|--------|-----|-----------------|
-| L | 1 | ~1600 kbit/s | 10 | 8 | 5 | ~1.0 Mbit/s |
-| M | 2 | ~960 kbit/s | 7 | 5 | 3 | ~0.73 Mbit/s |
-| S | 3 | ~640 kbit/s | 5 | 4 | 2 | ~0.59 Mbit/s |
+| Profile | ID | Mono bits | Stereo bits | RDS bits |
+|---------|----|-----------|-------------|----------|
+| L (Large) | 1 | 10 | 8 | 5 |
+| M (Medium) | 2 | 7 | 5 | 3 |
+| S (Small) | 3 | 5 | 4 | 2 |
+
+Payload size is content- and Rice-dependent; profiles differ by quantizer depth, not a fixed rate.
 
 Quality should be judged with **band-weighted** metrics (mono/stereo/RDS), not flat full-MPX waveform SNR. Flat MPX SNR unfairly weights ultrasonic stopbands the codec deliberately discards.
 
@@ -132,7 +133,7 @@ See [SFN.md](SFN.md).
 - `version` increments on breaking header changes.
 - Compressed payload magic/layout may evolve with new profile IDs without bumping
   protocol version if old profiles remain decodable.
-- Reserved profile IDs `4…255` for future rates (e.g. XS).
+- Reserved profile IDs `4…255` for future profiles (e.g. XS).
 
 ## Conformance
 

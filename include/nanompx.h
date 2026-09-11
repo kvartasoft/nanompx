@@ -30,9 +30,9 @@ typedef enum nanompx_mode {
 
 typedef enum nanompx_profile {
     NANOMPX_PROFILE_NONE = 0, /**< PCM / unused */
-    NANOMPX_PROFILE_L = 1,    /**< ~1600 kbps */
-    NANOMPX_PROFILE_M = 2,    /**< ~960 kbps */
-    NANOMPX_PROFILE_S = 3     /**< ~640 kbps */
+    NANOMPX_PROFILE_L = 1,    /**< Large — highest compressed quality */
+    NANOMPX_PROFILE_M = 2,    /**< Medium — balanced */
+    NANOMPX_PROFILE_S = 3     /**< Small — most aggressive compression */
 } nanompx_profile_t;
 
 typedef enum nanompx_err {
@@ -173,9 +173,6 @@ uint16_t nanompx_crc16(const uint8_t *data, size_t len);
 int nanompx_hdr_pack(uint8_t *dst, const nanompx_packet_hdr_t *hdr);
 int nanompx_hdr_unpack(nanompx_packet_hdr_t *hdr, const uint8_t *src);
 int nanompx_packet_validate(const uint8_t *packet, size_t packet_len);
-
-/** Target bitrate (bps) for a compressed profile. */
-uint32_t nanompx_profile_bitrate(nanompx_profile_t profile);
 
 const char *nanompx_strerror(int err);
 const char *nanompx_version_string(void);
