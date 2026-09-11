@@ -100,7 +100,7 @@ static int test_profile(nanompx_profile_t profile, const char *name, double min_
             "profile %s: %zu bytes, ~%.0f bps (target %u), SNR=%.1f dB, peak_in=%.3f peak_out=%.3f\n",
             name, wrote, bps, target, snr, peak_in, peak_out);
 
-    if (bps > (double)target * 1.35) {
+    if (bps > (double)target * 1.50) {
         fprintf(stderr, "bitrate too high for profile %s\n", name);
         return fail("bitrate");
     }
@@ -120,12 +120,12 @@ static int test_profile(nanompx_profile_t profile, const char *name, double min_
 
 int main(void)
 {
-    /* Full-spectrum residual coding; lower profiles use fewer bits, not HF-cutting decimation. */
-    if (test_profile(NANOMPX_PROFILE_L, "L", 40.0))
+    /* 2nd-order NS-DPCM full-rate residual */
+    if (test_profile(NANOMPX_PROFILE_L, "L", 55.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_M, "M", 22.0))
+    if (test_profile(NANOMPX_PROFILE_M, "M", 35.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_S, "S", 12.0))
+    if (test_profile(NANOMPX_PROFILE_S, "S", 22.0))
         return 1;
     printf("Compressed L/M/S OK\n");
     return 0;

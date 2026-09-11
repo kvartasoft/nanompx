@@ -62,41 +62,32 @@ FM-aware codec optimized for usable quality at L/M/S bitrates. Payload starts wi
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 1 | `0xC2` compressed magic (v2) |
+| 0 | 1 | `0xC3` compressed magic (v3) |
 | 1 | 1 | profile (L/M/S) |
 | 2 | 2 | `n_samples` |
 | 4 | 1 | residual quantizer bits |
-| 5 | 1 | residual decimation factor |
+| 5 | 1 | residual decimation factor (`1` = full rate) |
 | 6 | 2 | source peak (`peak * 65535`) |
 | 8 | … | bit-packed body |
 
 Body (bit-packed, LSB-first within each byte):
 
 1. Pilot amplitude `float32` + phase0 `float32` (phase referenced to absolute sample 0; continuous across frames)
-2. `u16 n_main` + predictive block-float residual codes
+2. `u16 n_main` + predictive noise-shaped block-float residual codes (u8 log scale per 32 samples)
 
 Processing model:
 
 1. Fit/subtract parametric 19 kHz pilot (protected).
-2. Optionally anti-alias and decimate the residual (`decim` from header).
-3. Encode with first-order DPCM + noise-shaped block floating-point (u8 log scale per 48 samples).
-4. Reconstruct: `residual + pilot`, then soft-limit to source peak.
+2. Encode residual with 1st-order DPCM + noise shaping at full 192 kHz.
+3. Reconstruct: `residual + pilot`, then soft-limit to source peak.
 
 #### Profiles
 
-| Profile | ID | Target bitrate | Intent |
-|---------|----|----------------|--------|
-| L (Large) | 1 | ~1600 kbit/s | Highest compressed quality |
-| M (Medium) | 2 | ~960 kbit/s | Balanced |
-| S (Small) | 3 | ~640 kbit/s | Constrained links |
-
-v2 reference table (normative for profile IDs 1–3):
-
-| Profile | bits | decim | Approx payload rate |
-|---------|------|-------|---------------------|
-| L | 8 | 1 | ~1536 kbit/s |
-| M | 5 | 1 | ~960 kbit/s |
-| S | 3 | 1 | ~576 kbit/s |
+| Profile | ID | Target bitrate | Bits | Approx payload rate |
+|---------|----|----------------|------|---------------------|
+| L (Large) | 1 | ~1600 kbit/s | 10 | ~1920 kbit/s |
+| M (Medium) | 2 | ~960 kbit/s | 6 | ~1152 kbit/s |
+| S (Small) | 3 | ~640 kbit/s | 4 | ~768 kbit/s |
 
 Log scale code: `scale = 2^((code - 140) / 16)` with `code` in 0…255.
 
@@ -105,6 +96,7 @@ Profile is present in **every** packet header. Switching profile on a stream req
 
 Peak control: decoders must not emit samples whose absolute level exceeds the encoded
 frame peak (soft limit). Encoders must not invent overshoots above the source frame peak.
+
 
 ## Transport
 

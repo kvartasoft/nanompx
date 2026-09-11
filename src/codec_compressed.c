@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: MIT */
 /**
- * FM-aware NanoMPX compressed codec (v2 wire: magic 0xC2).
+ * FM-aware NanoMPX compressed codec (v3 wire: magic 0xC3).
  *
- * Low-bit strategy focused on SNR:
- *  - parametric continuous 19 kHz pilot (tiny, protected)
- *  - DPCM + noise-shaped block-float on the residual
- *  - mild/no decimation so stereo/RDS spectrum is preserved
- *  - soft peak limit (no invented overshoots)
+ * - Continuous parametric 19 kHz pilot (protected)
+ * - 1st-order predictive + noise-shaped block-float residual @ 192 kHz
+ * - Profile bit depths chosen for SNR vs rate (L/M/S)
+ * - Soft peak limit (no invented overshoots)
  */
 
 #include "internal.h"
@@ -26,38 +25,8 @@ static float nanompx_exp2f(float x) { return expf(x * logf(2.f)); }
 #define exp2f nanompx_exp2f
 #endif
 
-typedef struct biquad {
-    float b0, b1, b2, a1, a2;
-    float z1, z2;
-} biquad_t;
-
-static void bq_reset(biquad_t *f) { f->z1 = f->z2 = 0.f; }
-
-static float bq_process(biquad_t *f, float x)
-{
-    float y = f->b0 * x + f->z1;
-    f->z1 = f->b1 * x - f->a1 * y + f->z2;
-    f->z2 = f->b2 * x - f->a2 * y;
-    return y;
-}
-
-static void bq_lowpass(biquad_t *f, float fc, float q)
-{
-    float w0 = (float)(2.0 * M_PI * fc / (double)NANOMPX_SAMPLE_RATE);
-    float alpha = sinf(w0) / (2.f * q);
-    float cosw = cosf(w0);
-    float a0 = 1.f + alpha;
-    f->b0 = ((1.f - cosw) * 0.5f) / a0;
-    f->b1 = (1.f - cosw) / a0;
-    f->b2 = f->b0;
-    f->a1 = (-2.f * cosw) / a0;
-    f->a2 = (1.f - alpha) / a0;
-    bq_reset(f);
-}
-
 typedef struct profile_cfg {
     int bits;
-    int decim;
 } profile_cfg_t;
 
 static profile_cfg_t profile_cfg(nanompx_profile_t p)
@@ -65,30 +34,24 @@ static profile_cfg_t profile_cfg(nanompx_profile_t p)
     profile_cfg_t c;
     switch (p) {
     case NANOMPX_PROFILE_L:
-        /* ~1536 kbit/s residual */
-        c.bits = 8;
-        c.decim = 1;
+        c.bits = 10; /* ~1920 kbit/s — SNR priority */
         break;
     case NANOMPX_PROFILE_M:
-        /* ~960 kbit/s residual — keep full spectrum, fewer bits */
-        c.bits = 5;
-        c.decim = 1;
+        c.bits = 6; /* ~1152 kbit/s */
         break;
     case NANOMPX_PROFILE_S:
     default:
-        /* ~576 kbit/s residual */
-        c.bits = 3;
-        c.decim = 1;
+        c.bits = 4; /* ~768 kbit/s */
         break;
     }
     return c;
 }
 
-#define BLOCK 48
-#define COMP_MAGIC 0xC2
+#define BLOCK 32
+#define COMP_MAGIC 0xC3
 #define PILOT_HZ 19000.0
-#define NS_COEF 0.55f
-#define SCALE_HEADROOM 1.20f
+#define NS_COEF 0.70f
+#define SCALE_HEADROOM 1.10f
 
 static int32_t float_to_pcm24(float x)
 {
@@ -230,53 +193,14 @@ static float u8_to_scale(uint8_t code)
     return exp2f(((float)code - 140.f) / 16.f);
 }
 
-static void filter_buf(biquad_t *f, const float *in, float *out, size_t n)
-{
-    size_t i;
-    bq_reset(f);
-    for (i = 0; i < n; i++)
-        out[i] = bq_process(f, in[i]);
-}
-
-static void decimate_pick(const float *in, size_t n, int decim, float *out, size_t *out_n)
-{
-    size_t i, k = 0;
-    for (i = 0; i < n; i += (size_t)decim)
-        out[k++] = in[i];
-    *out_n = k;
-}
-
-static void upsample_lin(const float *in, size_t in_n, int decim, float *out, size_t out_n)
-{
-    size_t i;
-    if (decim <= 1) {
-        size_t n = in_n < out_n ? in_n : out_n;
-        memcpy(out, in, n * sizeof(float));
-        for (i = n; i < out_n; i++)
-            out[i] = in_n ? in[in_n - 1] : 0.f;
-        return;
-    }
-    for (i = 0; i < out_n; i++) {
-        float pos = (float)i / (float)decim;
-        size_t i0 = (size_t)pos;
-        float frac = pos - (float)i0;
-        float a, b;
-        if (i0 >= in_n) {
-            out[i] = in_n ? in[in_n - 1] : 0.f;
-            continue;
-        }
-        a = in[i0];
-        b = (i0 + 1 < in_n) ? in[i0 + 1] : a;
-        out[i] = a + (b - a) * frac;
-    }
-}
-
 static int quantize_pred(const float *in, size_t n, int bits, bitw_t *w)
 {
     size_t off = 0;
     float prev = 0.f;
     float err = 0.f;
     int32_t qmax = (1 << (bits - 1)) - 1;
+    if (qmax < 1)
+        qmax = 1;
 
     while (off < n) {
         size_t len = n - off;
@@ -294,7 +218,6 @@ static int quantize_pred(const float *in, size_t n, int bits, bitw_t *w)
             p = in[off + i];
         }
         peak *= SCALE_HEADROOM;
-
         if (bitw_put(w, scale_to_u8(peak), 8))
             return -1;
         scale = u8_to_scale(scale_to_u8(peak));
@@ -323,6 +246,8 @@ static int dequantize_pred(float *out, size_t n, int bits, bitr_t *r)
     size_t off = 0;
     float prev = 0.f;
     int32_t qmax = (1 << (bits - 1)) - 1;
+    if (qmax < 1)
+        qmax = 1;
 
     while (off < n) {
         size_t len = n - off;
@@ -374,50 +299,47 @@ static void synth_pilot(float *out, size_t n, uint64_t sample_base, float amp, f
 
 struct nanompx_comp_enc {
     nanompx_profile_t profile;
-    biquad_t aa;
-    float *tmp;
-    float *scratch;
+    float *x;
     float *pilot;
+    float *res;
     size_t cap;
     uint64_t sample_phase;
 };
 
 struct nanompx_comp_dec {
-    float *scratch;
     float *pilot;
-    float *mainbuf;
+    float *res;
     size_t cap;
     uint64_t sample_phase;
 };
 
-static int ensure_enc_buf(nanompx_comp_enc_t *e, size_t n)
+static int ensure_enc(nanompx_comp_enc_t *e, size_t n)
 {
     if (e->cap >= n)
         return 0;
-    free(e->tmp);
-    e->tmp = (float *)malloc(sizeof(float) * n * 3);
-    if (!e->tmp) {
+    free(e->x);
+    e->x = (float *)malloc(sizeof(float) * n * 3);
+    if (!e->x) {
         e->cap = 0;
         return -1;
     }
-    e->scratch = e->tmp + n;
-    e->pilot = e->scratch + n;
+    e->pilot = e->x + n;
+    e->res = e->pilot + n;
     e->cap = n;
     return 0;
 }
 
-static int ensure_dec_buf(nanompx_comp_dec_t *d, size_t n)
+static int ensure_dec(nanompx_comp_dec_t *d, size_t n)
 {
     if (d->cap >= n)
         return 0;
-    free(d->scratch);
-    d->scratch = (float *)malloc(sizeof(float) * n * 3);
-    if (!d->scratch) {
+    free(d->pilot);
+    d->pilot = (float *)malloc(sizeof(float) * n * 2);
+    if (!d->pilot) {
         d->cap = 0;
         return -1;
     }
-    d->pilot = d->scratch + n;
-    d->mainbuf = d->pilot + n;
+    d->res = d->pilot + n;
     d->cap = n;
     return 0;
 }
@@ -437,7 +359,7 @@ void nanompx_comp_enc_destroy(nanompx_comp_enc_t *e)
 {
     if (!e)
         return;
-    free(e->tmp);
+    free(e->x);
     free(e);
 }
 
@@ -459,15 +381,14 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     bitw_t w;
     float peak = 0.f;
     float pamp, pphase;
-    size_t n_main;
     size_t hdr = 8;
     uint64_t base;
 
     if (!e || !samples || !dst || !out_len || count == 0 || count > 65535)
         return NANOMPX_ERR_INVALID;
-    if (ensure_enc_buf(e, count) != 0)
+    if (ensure_enc(e, count) != 0)
         return NANOMPX_ERR_NOMEM;
-    if (dst_cap < hdr + 32)
+    if (dst_cap < hdr + 64)
         return NANOMPX_ERR_OVERFLOW;
 
     if (keyframe)
@@ -477,35 +398,25 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     base = e->sample_phase;
 
     for (i = 0; i < count; i++) {
-        e->tmp[i] = pcm24_to_float(samples[i]);
+        e->x[i] = pcm24_to_float(samples[i]);
         {
-            float a = fabsf(e->tmp[i]);
+            float a = fabsf(e->x[i]);
             if (a > peak)
                 peak = a;
         }
     }
 
-    fit_pilot(e->tmp, count, base, &pamp, &pphase);
+    fit_pilot(e->x, count, base, &pamp, &pphase);
     synth_pilot(e->pilot, count, base, pamp, pphase);
     for (i = 0; i < count; i++)
-        e->scratch[i] = e->tmp[i] - e->pilot[i];
-
-    if (cfg.decim > 1) {
-        float fc = 0.45f * (float)NANOMPX_SAMPLE_RATE / (float)cfg.decim;
-        bq_lowpass(&e->aa, fc, 0.707f);
-        filter_buf(&e->aa, e->scratch, e->tmp, count);
-        decimate_pick(e->tmp, count, cfg.decim, e->scratch, &n_main);
-    } else {
-        n_main = count;
-        /* scratch already holds residual */
-    }
+        e->res[i] = e->x[i] - e->pilot[i];
 
     dst[0] = COMP_MAGIC;
     dst[1] = (uint8_t)e->profile;
     dst[2] = (uint8_t)(count & 0xff);
     dst[3] = (uint8_t)((count >> 8) & 0xff);
     dst[4] = (uint8_t)cfg.bits;
-    dst[5] = (uint8_t)cfg.decim;
+    dst[5] = 1;
     {
         uint16_t pk = (uint16_t)lrintf(peak * 65535.f);
         dst[6] = (uint8_t)(pk & 0xff);
@@ -515,8 +426,7 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     bitw_init(&w, dst + hdr, dst_cap - hdr);
     if (bitw_put_f32(&w, pamp) || bitw_put_f32(&w, pphase))
         return NANOMPX_ERR_OVERFLOW;
-    if (bitw_put(&w, (uint32_t)n_main, 16) ||
-        quantize_pred(e->scratch, n_main, cfg.bits, &w))
+    if (bitw_put(&w, (uint32_t)count, 16) || quantize_pred(e->res, count, cfg.bits, &w))
         return NANOMPX_ERR_OVERFLOW;
 
     *out_len = hdr + bitw_bytes(&w);
@@ -533,7 +443,7 @@ void nanompx_comp_dec_destroy(nanompx_comp_dec_t *d)
 {
     if (!d)
         return;
-    free(d->scratch);
+    free(d->pilot);
     free(d);
 }
 
@@ -543,14 +453,12 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
                         int32_t *samples, size_t max_samples, size_t *out_count,
                         int keyframe)
 {
-    size_t count;
+    size_t count, n;
     bitr_t r;
-    float peak;
-    float pamp, pphase;
-    size_t n_main;
+    float peak, pamp, pphase;
     int32_t tmp;
     size_t i;
-    int bits, decim;
+    int bits;
     uint64_t base;
 
     (void)profile;
@@ -561,14 +469,12 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
 
     count = (size_t)src[2] | ((size_t)src[3] << 8);
     bits = src[4];
-    decim = src[5];
-    if (bits < 2 || bits > 15 || decim < 1 || decim > 16)
+    if (bits < 2 || bits > 15)
         return NANOMPX_ERR_INVALID;
-
     peak = ((float)(src[6] | (src[7] << 8))) / 65535.f;
     if (count == 0 || count > max_samples)
         return NANOMPX_ERR_INVALID;
-    if (ensure_dec_buf(d, count) != 0)
+    if (ensure_dec(d, count) != 0)
         return NANOMPX_ERR_NOMEM;
 
     if (keyframe)
@@ -580,16 +486,15 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
         return NANOMPX_ERR_INVALID;
     if (bitr_get(&r, 16, &tmp))
         return NANOMPX_ERR_INVALID;
-    n_main = (size_t)(uint16_t)tmp;
-    if (n_main == 0 || n_main > count)
+    n = (size_t)(uint16_t)tmp;
+    if (n != count)
         return NANOMPX_ERR_INVALID;
-    if (dequantize_pred(d->scratch, n_main, bits, &r))
+    if (dequantize_pred(d->res, n, bits, &r))
         return NANOMPX_ERR_INVALID;
-    upsample_lin(d->scratch, n_main, decim, d->mainbuf, count);
     synth_pilot(d->pilot, count, base, pamp, pphase);
 
     for (i = 0; i < count; i++) {
-        float y = d->mainbuf[i] + d->pilot[i];
+        float y = d->res[i] + d->pilot[i];
         if (peak > 0.f) {
             if (y > peak)
                 y = peak;
