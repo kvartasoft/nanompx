@@ -11,7 +11,7 @@ cd build && ctest --output-on-failure
 |------|--------|
 | `test_roundtrip` | PCM encode/decode bit-exact |
 | `test_clock_sfn` | SFN delay gating + GPS inject lock |
-| `test_compressed` | L/M/S decode, no invented overshoots, bitrate bound |
+| `test_compressed` | L/M/S band-weighted mono/stereo SNR, bitrate, no overshoots |
 
 ## Interop vectors
 
@@ -40,3 +40,16 @@ Terminal B:
 1. Two decoders, shared PPS or `nanompx_clock_sim` with common origin.
 2. Same `network_delay_ns` on both.
 3. Correlate outputs; calibrate hardware delay into `user_offset_ns`.
+
+
+## Quality metrics (compressed)
+
+Flat full-MPX waveform SNR is **not** the primary gate. The compressed mode drops energy
+outside FM bands on purpose. Tests report:
+
+- **mono** SNR in ≈0.2–15 kHz
+- **stereo** SNR in ≈23–53 kHz
+- **RDS** SNR near 57 kHz
+- **weighted** = 0.55·mono + 0.35·stereo + 0.10·RDS
+
+Outputs are delay-aligned (filterbank group delay) before scoring.

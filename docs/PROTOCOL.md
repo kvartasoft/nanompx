@@ -58,45 +58,52 @@ Approximate bitrate: `192000 × 24 ≈ 4.608 Mbit/s` plus header overhead.
 
 ### Mode 1 — COMPRESSED
 
-FM-aware codec optimized for usable quality at L/M/S bitrates. Payload starts with:
+FM band codec (magic `0xC4`) with Rice-coded predictive residuals.
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 1 | `0xC3` compressed magic (v3) |
+| 0 | 1 | `0xC4` compressed magic (v4) |
 | 1 | 1 | profile (L/M/S) |
 | 2 | 2 | `n_samples` |
-| 4 | 1 | residual quantizer bits |
-| 5 | 1 | residual decimation factor (`1` = full rate) |
+| 4 | 1 | `(bits_mono<<4) | bits_stereo` |
+| 5 | 1 | `(bits_rds<<4) | rice_tip_mono` |
 | 6 | 2 | source peak (`peak * 65535`) |
 | 8 | … | bit-packed body |
 
-Body (bit-packed, LSB-first within each byte):
+Body (LSB-first bits):
 
-1. Pilot amplitude `float32` + phase0 `float32` (phase referenced to absolute sample 0; continuous across frames)
-2. `u16 n_main` + predictive noise-shaped block-float residual codes (u8 log scale per 32 samples)
+1. Pilot amplitude `float32` + phase0 `float32` (phase locked after keyframe; `sin(ωt+φ)` model)
+2. `rice_tip_stereo` u4 + `rice_tip_rds` u4
+3. `n_mono`, `n_stereo`, `n_rds` as u16 each
+4. For each band: blocks of `{rice_k u4, scale u8, Rice-coded DPCM codes}`
 
 Processing model:
 
-1. Fit/subtract parametric 19 kHz pilot (protected).
-2. Encode residual with 1st-order DPCM + noise shaping at full 192 kHz.
-3. Reconstruct: `residual + pilot`, then soft-limit to source peak.
+1. Fit/lock parametric 19 kHz pilot (protected). Subtract from MPX.
+2. Demodulate FM bands with 1×/2×/3× pilot phase:
+   - **Mono** (0–15 kHz): LP → decimate ×4 (48 kHz)
+   - **Stereo L−R** (≈23–53 kHz): ×2sin(2θ) → LP → decimate ×4
+   - **RDS** (≈57 kHz): ×2sin(3θ) → narrow LP → decimate ×32
+3. Encode each band with noise-shaped DPCM + adaptive Rice (`k` per 32-sample block).
+4. Reconstruct with matched upsample/LP, remodulate, add delayed pilot (filter delay compensated).
+5. Soft-limit to source peak.
 
-#### Profiles
+#### Profiles (reference bit allocation)
 
-| Profile | ID | Target bitrate | Bits | Approx payload rate |
-|---------|----|----------------|------|---------------------|
-| L (Large) | 1 | ~1600 kbit/s | 10 | ~1920 kbit/s |
-| M (Medium) | 2 | ~960 kbit/s | 6 | ~1152 kbit/s |
-| S (Small) | 3 | ~640 kbit/s | 4 | ~768 kbit/s |
+| Profile | ID | Target | Mono | Stereo | RDS | Typical payload |
+|---------|----|--------|------|--------|-----|-----------------|
+| L | 1 | ~1600 kbit/s | 10 | 8 | 5 | ~1.0 Mbit/s |
+| M | 2 | ~960 kbit/s | 7 | 5 | 3 | ~0.73 Mbit/s |
+| S | 3 | ~640 kbit/s | 5 | 4 | 2 | ~0.59 Mbit/s |
 
-Log scale code: `scale = 2^((code - 140) / 16)` with `code` in 0…255.
+Quality should be judged with **band-weighted** metrics (mono/stereo/RDS), not flat full-MPX waveform SNR. Flat MPX SNR unfairly weights ultrasonic stopbands the codec deliberately discards.
 
-Profile is present in **every** packet header. Switching profile on a stream requires
-`KEYFRAME` or `DISCONTINUITY`. Mixing profiles without that is invalid.
+Log scale: `scale = 2^((code - 140) / 16)`.
+
+Profile is present in **every** packet header. Switching profile requires `KEYFRAME` or `DISCONTINUITY`.
 
 Peak control: decoders must not emit samples whose absolute level exceeds the encoded
 frame peak (soft limit). Encoders must not invent overshoots above the source frame peak.
-
 
 ## Transport
 
