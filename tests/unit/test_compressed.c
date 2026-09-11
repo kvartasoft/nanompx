@@ -11,13 +11,13 @@ static int fail(const char *msg)
     return 1;
 }
 
-static int test_profile(nanompx_profile_t profile, const char *name)
+static int test_profile(nanompx_profile_t profile, const char *name, double min_snr_db)
 {
-    const unsigned n = NANOMPX_DEFAULT_FRAME_SAMPLES * 2;
+    const unsigned n = NANOMPX_DEFAULT_FRAME_SAMPLES * 4;
     int32_t *in;
     int32_t *out;
     uint8_t *pkt;
-    size_t pkt_cap = 256 * 1024;
+    size_t pkt_cap = 512 * 1024;
     size_t wrote = 0, decoded = 0, off = 0;
     nanompx_encoder_t *enc;
     nanompx_decoder_t *dec;
@@ -26,6 +26,7 @@ static int test_profile(nanompx_profile_t profile, const char *name)
     double peak_in = 0, peak_out = 0;
     uint32_t target = nanompx_profile_bitrate(profile);
     double bps;
+    double err2 = 0.0, sig2 = 0.0, snr;
 
     in = (int32_t *)calloc(n, sizeof(int32_t));
     out = (int32_t *)calloc(n, sizeof(int32_t));
@@ -82,22 +83,30 @@ static int test_profile(nanompx_profile_t profile, const char *name)
     }
 
     for (i = 0; i < n; i++) {
-        double x = fabs((double)out[i] / 8388608.0);
-        if (x > peak_out)
-            peak_out = x;
-        /* No invented overshoots above source peak (+ small margin). */
-        if (x > peak_in + 0.02)
+        double xi = (double)in[i] / 8388608.0;
+        double xo = (double)out[i] / 8388608.0;
+        double e = xo - xi;
+        if (fabs(xo) > peak_out)
+            peak_out = fabs(xo);
+        if (fabs(xo) > peak_in + 0.02)
             return fail("invented overshoot");
+        err2 += e * e;
+        sig2 += xi * xi;
     }
+    snr = 10.0 * log10((sig2 + 1e-20) / (err2 + 1e-20));
 
     bps = (double)wrote * 8.0 * ((double)NANOMPX_SAMPLE_RATE / (double)n);
-    fprintf(stderr, "profile %s: %zu bytes, ~%.0f bps (target %u), peak_in=%.3f peak_out=%.3f\n",
-            name, wrote, bps, target, peak_in, peak_out);
+    fprintf(stderr,
+            "profile %s: %zu bytes, ~%.0f bps (target %u), SNR=%.1f dB, peak_in=%.3f peak_out=%.3f\n",
+            name, wrote, bps, target, snr, peak_in, peak_out);
 
-    /* Allow generous margin vs target — v1 encoder is not rate-exact. */
-    if (bps > (double)target * 2.5) {
+    if (bps > (double)target * 1.35) {
         fprintf(stderr, "bitrate too high for profile %s\n", name);
         return fail("bitrate");
+    }
+    if (snr < min_snr_db) {
+        fprintf(stderr, "SNR too low for profile %s (%.1f < %.1f)\n", name, snr, min_snr_db);
+        return fail("snr");
     }
 
     nanompx_encoder_destroy(enc);
@@ -111,11 +120,12 @@ static int test_profile(nanompx_profile_t profile, const char *name)
 
 int main(void)
 {
-    if (test_profile(NANOMPX_PROFILE_L, "L"))
+    /* Full-spectrum residual coding; lower profiles use fewer bits, not HF-cutting decimation. */
+    if (test_profile(NANOMPX_PROFILE_L, "L", 40.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_M, "M"))
+    if (test_profile(NANOMPX_PROFILE_M, "M", 22.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_S, "S"))
+    if (test_profile(NANOMPX_PROFILE_S, "S", 12.0))
         return 1;
     printf("Compressed L/M/S OK\n");
     return 0;

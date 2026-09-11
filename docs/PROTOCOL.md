@@ -58,27 +58,29 @@ Approximate bitrate: `192000 × 24 ≈ 4.608 Mbit/s` plus header overhead.
 
 ### Mode 1 — COMPRESSED
 
-FM-aware band-split codec. Payload starts with:
+FM-aware codec optimized for usable quality at L/M/S bitrates. Payload starts with:
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 1 | `0xC1` compressed magic |
+| 0 | 1 | `0xC2` compressed magic (v2) |
 | 1 | 1 | profile (L/M/S) |
 | 2 | 2 | `n_samples` |
-| 4 | 1 | baseband quantizer bits |
-| 5 | 1 | difference quantizer bits |
+| 4 | 1 | residual quantizer bits |
+| 5 | 1 | residual decimation factor |
 | 6 | 2 | source peak (`peak * 65535`) |
 | 8 | … | bit-packed body |
 
 Body (bit-packed, LSB-first within each byte):
 
-1. Pilot amplitude `float32` + phase `float32` (parametric 19 kHz)
-2. `u16 n_rds` + `n_rds` × int16 RDS decimated samples
-3. `u16 n_bb` + block-float quantized baseband
-4. `u16 n_diff` + block-float quantized L−R band
+1. Pilot amplitude `float32` + phase0 `float32` (phase referenced to absolute sample 0; continuous across frames)
+2. `u16 n_main` + predictive block-float residual codes
 
-Decimation and bit depths are determined by profile (see below). Decoders must use the
-same profile table for upsample factors.
+Processing model:
+
+1. Fit/subtract parametric 19 kHz pilot (protected).
+2. Optionally anti-alias and decimate the residual (`decim` from header).
+3. Encode with first-order DPCM + noise-shaped block floating-point (u8 log scale per 48 samples).
+4. Reconstruct: `residual + pilot`, then soft-limit to source peak.
 
 #### Profiles
 
@@ -88,13 +90,15 @@ same profile table for upsample factors.
 | M (Medium) | 2 | ~960 kbit/s | Balanced |
 | S (Small) | 3 | ~640 kbit/s | Constrained links |
 
-v1 reference quantizer / decimation table (normative for profile IDs 1–3):
+v2 reference table (normative for profile IDs 1–3):
 
-| Profile | bb_bits | diff_bits | bb_decim | diff_decim | rds_decim |
-|---------|---------|-----------|----------|------------|-----------|
-| L | 10 | 8 | 2 | 4 | 8 |
-| M | 8 | 6 | 4 | 4 | 8 |
-| S | 6 | 5 | 4 | 8 | 16 |
+| Profile | bits | decim | Approx payload rate |
+|---------|------|-------|---------------------|
+| L | 8 | 1 | ~1536 kbit/s |
+| M | 5 | 1 | ~960 kbit/s |
+| S | 3 | 1 | ~576 kbit/s |
+
+Log scale code: `scale = 2^((code - 140) / 16)` with `code` in 0…255.
 
 Profile is present in **every** packet header. Switching profile on a stream requires
 `KEYFRAME` or `DISCONTINUITY`. Mixing profiles without that is invalid.
