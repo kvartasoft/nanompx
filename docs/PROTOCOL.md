@@ -34,7 +34,7 @@ All multi-byte integer fields are **little-endian**.
 | 7 | 1 | `flags` | bit0 keyframe, bit1 discontinuity, bit2 FEC |
 | 8 | 4 | `seq` | monotonically increasing sequence number |
 | 12 | 8 | `sample_index` | index of first sample in this frame |
-| 20 | 8 | `capture_time_ns` | GPS-tied capture time of first sample (ns) |
+| 20 | 8 | `capture_time_ns` | capture time of first sample (sample-rate timeline, GPS-tied) |
 | 28 | 2 | `payload_len` | payload bytes following header |
 | 30 | 2 | `hdr_crc` | CRC-16/CCITT-FALSE over bytes 0–29 (`init=0xFFFF`, poly `0x1021`) |
 

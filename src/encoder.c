@@ -14,6 +14,10 @@ struct nanompx_encoder {
     nanompx_comp_enc_t *comp;
     nanompx_stats_t stats;
     int need_keyframe;
+    unsigned keyframe_interval; /* frames; 0 = discontinuity only */
+    unsigned frames_since_kf;
+    int have_capture_timeline;
+    uint64_t next_capture_ns;
 };
 
 nanompx_encoder_t *nanompx_encoder_create(void)
@@ -25,6 +29,7 @@ nanompx_encoder_t *nanompx_encoder_create(void)
     enc->profile = NANOMPX_PROFILE_L;
     enc->frame_samples = NANOMPX_DEFAULT_FRAME_SAMPLES;
     enc->need_keyframe = 1;
+    enc->keyframe_interval = 50; /* ~0.5 s @ 10 ms */
     enc->comp = nanompx_comp_enc_create(enc->profile);
     if (!enc->comp) {
         free(enc);
@@ -49,6 +54,7 @@ int nanompx_encoder_set_mode(nanompx_encoder_t *enc, nanompx_mode_t mode)
     if (enc->mode != mode) {
         enc->mode = mode;
         enc->need_keyframe = 1;
+        enc->have_capture_timeline = 0;
     }
     return NANOMPX_OK;
 }
@@ -79,8 +85,24 @@ int nanompx_encoder_set_frame_samples(nanompx_encoder_t *enc, unsigned frame_sam
 {
     if (!enc || frame_samples == 0 || frame_samples > 65535)
         return NANOMPX_ERR_INVALID;
+    /* Compressed path needs enough samples for RDS decimation. */
+    if (enc->mode == NANOMPX_MODE_COMPRESSED && frame_samples < 32)
+        return NANOMPX_ERR_INVALID;
     enc->frame_samples = frame_samples;
     return NANOMPX_OK;
+}
+
+int nanompx_encoder_set_keyframe_interval(nanompx_encoder_t *enc, unsigned frames)
+{
+    if (!enc)
+        return NANOMPX_ERR_INVALID;
+    enc->keyframe_interval = frames;
+    return NANOMPX_OK;
+}
+
+unsigned nanompx_compressed_delay_samples(void)
+{
+    return nanompx_comp_codec_delay_samples();
 }
 
 static int ensure_pending(nanompx_encoder_t *enc, size_t need)
@@ -97,14 +119,22 @@ static int ensure_pending(nanompx_encoder_t *enc, size_t need)
     return 0;
 }
 
+static uint64_t clock_now_u64(nanompx_encoder_t *enc)
+{
+    int64_t now = 0;
+    if (enc->clock && nanompx_clock_now_ns(enc->clock, &now) == 0)
+        return (uint64_t)now;
+    return (uint64_t)nanompx_host_time_ns();
+}
+
 static int emit_frame(nanompx_encoder_t *enc, const int32_t *frame, unsigned n,
                       uint8_t *out_buf, size_t out_cap, size_t *written)
 {
     nanompx_packet_hdr_t hdr;
     uint8_t *payload;
     size_t payload_len = 0;
-    int64_t now = 0;
     int rc;
+    int is_kf;
 
     if (out_cap < NANOMPX_HDR_SIZE)
         return NANOMPX_ERR_OVERFLOW;
@@ -116,18 +146,28 @@ static int emit_frame(nanompx_encoder_t *enc, const int32_t *frame, unsigned n,
     hdr.profile = (enc->mode == NANOMPX_MODE_COMPRESSED) ? (uint8_t)enc->profile
                                                          : (uint8_t)NANOMPX_PROFILE_NONE;
     hdr.flags = 0;
-    if (enc->need_keyframe) {
-            hdr.flags |= NANOMPX_FLAG_KEYFRAME;
-            hdr.flags |= NANOMPX_FLAG_DISCONTINUITY;
-            enc->need_keyframe = 0;
+    is_kf = enc->need_keyframe;
+    if (!is_kf && enc->mode == NANOMPX_MODE_COMPRESSED && enc->keyframe_interval > 0 &&
+        enc->frames_since_kf >= enc->keyframe_interval)
+        is_kf = 1;
+    if (is_kf) {
+        hdr.flags |= NANOMPX_FLAG_KEYFRAME;
+        hdr.flags |= NANOMPX_FLAG_DISCONTINUITY;
+        enc->need_keyframe = 0;
+        enc->frames_since_kf = 0;
     }
     hdr.seq = enc->seq++;
     hdr.sample_index = enc->sample_index;
 
-    if (enc->clock && nanompx_clock_now_ns(enc->clock, &now) == 0)
-        hdr.capture_time_ns = (uint64_t)now;
-    else
-        hdr.capture_time_ns = (uint64_t)nanompx_host_time_ns();
+    /* Capture time of first sample: sample-rate timeline, anchored on first frame /
+     * discontinuity — not wall-clock-at-emit (which breaks file encode + SFN). */
+    if (!enc->have_capture_timeline) {
+        enc->next_capture_ns = clock_now_u64(enc);
+        enc->have_capture_timeline = 1;
+    }
+    hdr.capture_time_ns = enc->next_capture_ns;
+    enc->next_capture_ns +=
+        (uint64_t)n * 1000000000ull / (uint64_t)NANOMPX_SAMPLE_RATE;
 
     payload = out_buf + NANOMPX_HDR_SIZE;
     if (enc->mode == NANOMPX_MODE_PCM) {
@@ -136,9 +176,8 @@ static int emit_frame(nanompx_encoder_t *enc, const int32_t *frame, unsigned n,
             return NANOMPX_ERR_OVERFLOW;
     } else {
         size_t clen = 0;
-        rc = nanompx_comp_encode(enc->comp, frame, n, payload,
-                                 out_cap - NANOMPX_HDR_SIZE, &clen,
-                                 (hdr.flags & NANOMPX_FLAG_KEYFRAME) != 0);
+        rc = nanompx_comp_encode(enc->comp, frame, n, payload, out_cap - NANOMPX_HDR_SIZE,
+                                 &clen, is_kf, enc->sample_index);
         if (rc != NANOMPX_OK)
             return rc;
         payload_len = clen;
@@ -151,6 +190,7 @@ static int emit_frame(nanompx_encoder_t *enc, const int32_t *frame, unsigned n,
 
     *written = NANOMPX_HDR_SIZE + payload_len;
     enc->sample_index += n;
+    enc->frames_since_kf++;
     enc->stats.packets_out++;
     enc->stats.samples_encoded += n;
     enc->stats.clock_locked = enc->clock ? nanompx_clock_locked(enc->clock) : 0;
@@ -165,7 +205,6 @@ int nanompx_encoder_push_pcm(nanompx_encoder_t *enc,
                              size_t *out_bytes)
 {
     size_t total = 0;
-    size_t in_off = 0;
 
     if (!enc || !samples || !out_buf || !out_bytes)
         return NANOMPX_ERR_INVALID;
@@ -179,17 +218,50 @@ int nanompx_encoder_push_pcm(nanompx_encoder_t *enc,
 
     while (enc->pending_count >= enc->frame_samples) {
         size_t wrote = 0;
-        int rc = emit_frame(enc, enc->pending, enc->frame_samples,
-                            out_buf + total, out_cap - total, &wrote);
+        int rc = emit_frame(enc, enc->pending, enc->frame_samples, out_buf + total,
+                            out_cap - total, &wrote);
         if (rc != NANOMPX_OK)
             return rc;
         total += wrote;
         enc->pending_count -= enc->frame_samples;
         memmove(enc->pending, enc->pending + enc->frame_samples,
                 enc->pending_count * sizeof(int32_t));
-        (void)in_off;
     }
 
+    *out_bytes = total;
+    return NANOMPX_OK;
+}
+
+int nanompx_encoder_flush(nanompx_encoder_t *enc,
+                          uint8_t *out_buf,
+                          size_t out_cap,
+                          size_t *out_bytes)
+{
+    size_t total = 0;
+    unsigned n;
+
+    if (!enc || !out_buf || !out_bytes)
+        return NANOMPX_ERR_INVALID;
+    *out_bytes = 0;
+    if (enc->pending_count == 0)
+        return NANOMPX_OK;
+
+    n = enc->frame_samples;
+    if (ensure_pending(enc, n) != 0)
+        return NANOMPX_ERR_NOMEM;
+    /* Zero-pad to a full frame so framing stays consistent. */
+    memset(enc->pending + enc->pending_count, 0,
+           (n - enc->pending_count) * sizeof(int32_t));
+    enc->pending_count = n;
+
+    {
+        size_t wrote = 0;
+        int rc = emit_frame(enc, enc->pending, n, out_buf, out_cap, &wrote);
+        if (rc != NANOMPX_OK)
+            return rc;
+        total = wrote;
+        enc->pending_count = 0;
+    }
     *out_bytes = total;
     return NANOMPX_OK;
 }
@@ -206,6 +278,8 @@ int nanompx_encoder_signal_discontinuity(nanompx_encoder_t *enc)
     if (!enc)
         return NANOMPX_ERR_INVALID;
     enc->need_keyframe = 1;
+    enc->have_capture_timeline = 0;
+    enc->frames_since_kf = enc->keyframe_interval; /* force KF soon */
     return NANOMPX_OK;
 }
 

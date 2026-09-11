@@ -10,9 +10,18 @@ Single Frequency Network (SFN) operation requires that every transmitter radiate
 3. Each decoder buffers until:
 
    `now >= capture_time_ns + network_delay_ns + user_offset_ns`
+   (compressed mode also subtracts `nanompx_compressed_delay_samples()` ≈ 64 samples
+   so filterbank delay stays SFN-aligned with PCM)
 
 4. All sites share the same `network_delay_ns`. Use `user_offset_ns` only for fine
    RF interference alignment.
+
+`capture_time_ns` is the capture time of the **first sample** of the frame on a
+sample-rate timeline (anchored at stream start / discontinuity), not “encode wall
+clock at emit”.
+
+Compressed streams emit periodic KEYFRAMEs (default every 50 frames) so decoders can
+resynchronize after packet loss.
 
 ```text
 Studio  --encode+timestamp-->  IP  -->  Tx A decode@T

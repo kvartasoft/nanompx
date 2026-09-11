@@ -95,6 +95,11 @@ int nanompx_encoder_set_mode(nanompx_encoder_t *enc, nanompx_mode_t mode);
 int nanompx_encoder_set_profile(nanompx_encoder_t *enc, nanompx_profile_t profile);
 int nanompx_encoder_set_clock(nanompx_encoder_t *enc, nanompx_clock_t *clock);
 int nanompx_encoder_set_frame_samples(nanompx_encoder_t *enc, unsigned frame_samples);
+/**
+ * Periodic KEYFRAME interval in frames (compressed). 0 = only on discontinuity.
+ * Default: 50 (~0.5 s at 10 ms frames) so decoders can recover after loss.
+ */
+int nanompx_encoder_set_keyframe_interval(nanompx_encoder_t *enc, unsigned frames);
 
 /**
  * Push interleaved mono MPX PCM as signed 24-bit integers in the low 24 bits
@@ -108,10 +113,21 @@ int nanompx_encoder_push_pcm(nanompx_encoder_t *enc,
                              size_t out_cap,
                              size_t *out_bytes);
 
+/**
+ * Flush pending samples (zero-pad to a full frame if needed). Call at end of stream.
+ */
+int nanompx_encoder_flush(nanompx_encoder_t *enc,
+                          uint8_t *out_buf,
+                          size_t out_cap,
+                          size_t *out_bytes);
+
 void nanompx_encoder_get_stats(const nanompx_encoder_t *enc, nanompx_stats_t *out);
 
 /** Force KEYFRAME on the next packet (profile change / stream recovery). */
 int nanompx_encoder_signal_discontinuity(nanompx_encoder_t *enc);
+
+/** Compressed codec algorithmic delay in samples (0 for PCM). */
+unsigned nanompx_compressed_delay_samples(void);
 
 /**
  * FEC sizing hint for future parity packets. Returns 0 in v1 (FEC not emitted).

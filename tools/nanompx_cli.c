@@ -197,6 +197,12 @@ static int cmd_encode(int argc, char **argv)
         produced += chunk;
         off += chunk;
     }
+    {
+        size_t wrote = 0;
+        int rc = nanompx_encoder_flush(enc, out + out_len, out_cap - out_len, &wrote);
+        if (rc == NANOMPX_OK)
+            out_len += wrote;
+    }
 
     if (write_all(out_path, out, out_len) != 0)
         fprintf(stderr, "failed to write %s\n", out_path);
@@ -451,6 +457,21 @@ static int cmd_srt_send(int argc, char **argv)
             p += plen;
         }
         off += chunk;
+    }
+    {
+        size_t wrote = 0, p = 0;
+        nanompx_encoder_flush(enc, pktbuf, sizeof(pktbuf), &wrote);
+        while (p < wrote) {
+            nanompx_packet_hdr_t hdr;
+            size_t plen;
+            nanompx_hdr_unpack(&hdr, pktbuf + p);
+            plen = NANOMPX_HDR_SIZE + hdr.payload_len;
+            if (nanompx_srt_send(srt, pktbuf + p, plen) < 0) {
+                fprintf(stderr, "srt send failed\n");
+                break;
+            }
+            p += plen;
+        }
     }
 
     nanompx_encoder_destroy(enc);

@@ -456,8 +456,11 @@ static void refine_pilot_amp(const float *x, size_t n, uint64_t sample_base, flo
     }
     sI *= 2.0 / (double)n;
     sQ *= 2.0 / (double)n;
-    /* Project onto locked phase (phase0 already defines I/Q rotation) */
-    *amp = (float)sqrt(sI * sI + sQ * sQ);
+    (void)sI;
+    /* Project onto locked sin(ωt+φ) model: amp ≈ 〈x, sin〉 */
+    *amp = (float)sQ;
+    if (*amp < 0.f)
+        *amp = 0.f;
 }
 
 static void fit_pilot(const float *x, size_t n, uint64_t sample_base, float *amp, float *phase0)
@@ -518,7 +521,6 @@ struct nanompx_comp_enc {
     float *x;
     float *work;
     size_t cap;
-    uint64_t sample_phase;
     fir_state_t fir_mono;
     fir_state_t fir_st;
     fir_state_t fir_rds;
@@ -536,7 +538,6 @@ struct nanompx_comp_enc {
 struct nanompx_comp_dec {
     float *work;
     size_t cap;
-    uint64_t sample_phase;
     fir_state_t fir_mono_i;
     fir_state_t fir_st_i;
     fir_state_t fir_rds_i;
@@ -547,6 +548,53 @@ struct nanompx_comp_dec {
     float pred_st;
     float pred_rds;
 };
+
+typedef struct enc_snap {
+    fir_state_t fir_mono;
+    fir_state_t fir_st;
+    fir_state_t fir_rds;
+    int phase_mono;
+    int phase_st;
+    int phase_rds;
+    float pred_mono;
+    float pred_st;
+    float pred_rds;
+    float pilot_amp;
+    float pilot_phase0;
+    int pilot_locked;
+} enc_snap_t;
+
+static void enc_save(const nanompx_comp_enc_t *e, enc_snap_t *s)
+{
+    s->fir_mono = e->fir_mono;
+    s->fir_st = e->fir_st;
+    s->fir_rds = e->fir_rds;
+    s->phase_mono = e->phase_mono;
+    s->phase_st = e->phase_st;
+    s->phase_rds = e->phase_rds;
+    s->pred_mono = e->pred_mono;
+    s->pred_st = e->pred_st;
+    s->pred_rds = e->pred_rds;
+    s->pilot_amp = e->pilot_amp;
+    s->pilot_phase0 = e->pilot_phase0;
+    s->pilot_locked = e->pilot_locked;
+}
+
+static void enc_restore(nanompx_comp_enc_t *e, const enc_snap_t *s)
+{
+    e->fir_mono = s->fir_mono;
+    e->fir_st = s->fir_st;
+    e->fir_rds = s->fir_rds;
+    e->phase_mono = s->phase_mono;
+    e->phase_st = s->phase_st;
+    e->phase_rds = s->phase_rds;
+    e->pred_mono = s->pred_mono;
+    e->pred_st = s->pred_st;
+    e->pred_rds = s->pred_rds;
+    e->pilot_amp = s->pilot_amp;
+    e->pilot_phase0 = s->pilot_phase0;
+    e->pilot_locked = s->pilot_locked;
+}
 
 /* work layout for encoder: res, mix, filt, mono_d, st_d, rds_d, mono_u, st_u, rds_u */
 static int ensure_enc(nanompx_comp_enc_t *e, size_t n)
@@ -607,9 +655,8 @@ int nanompx_comp_enc_set_profile(nanompx_comp_enc_t *e, nanompx_profile_t profil
     return NANOMPX_OK;
 }
 
-static void reset_enc_state(nanompx_comp_enc_t *e)
+static void reset_enc_filters(nanompx_comp_enc_t *e)
 {
-    e->sample_phase = 0;
     fir_reset(&e->fir_mono);
     fir_reset(&e->fir_st);
     fir_reset(&e->fir_rds);
@@ -620,9 +667,10 @@ static void reset_enc_state(nanompx_comp_enc_t *e)
     e->pilot_locked = 0;
 }
 
-static void reset_dec_state(nanompx_comp_dec_t *d)
+void nanompx_comp_dec_reset(nanompx_comp_dec_t *d)
 {
-    d->sample_phase = 0;
+    if (!d)
+        return;
     fir_reset(&d->fir_mono_i);
     fir_reset(&d->fir_st_i);
     fir_reset(&d->fir_rds_i);
@@ -630,10 +678,15 @@ static void reset_dec_state(nanompx_comp_dec_t *d)
     d->pred_mono = d->pred_st = d->pred_rds = 0.f;
 }
 
+unsigned nanompx_comp_codec_delay_samples(void)
+{
+    return (unsigned)CODEC_DELAY;
+}
+
 int nanompx_comp_encode(nanompx_comp_enc_t *e,
                         const int32_t *samples, size_t count,
                         uint8_t *dst, size_t dst_cap, size_t *out_len,
-                        int keyframe)
+                        int keyframe, uint64_t sample_base)
 {
     size_t i;
     profile_cfg_t cfg;
@@ -641,10 +694,11 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     float peak = 0.f;
     float pamp, pphase;
     size_t hdr = 8;
-    uint64_t base;
     float *res, *mix, *mono_d, *st_d, *rds_d;
     size_t n_mono = 0, n_st = 0, n_rds = 0;
     double w19;
+    enc_snap_t snap;
+    int rc = NANOMPX_OK;
 
     if (!e || !samples || !dst || !out_len || count == 0 || count > 65535)
         return NANOMPX_ERR_INVALID;
@@ -656,10 +710,11 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
         return NANOMPX_ERR_OVERFLOW;
 
     if (keyframe)
-        reset_enc_state(e);
+        reset_enc_filters(e);
+
+    enc_save(e, &snap);
 
     cfg = profile_cfg(e->profile);
-    base = e->sample_phase;
     w19 = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
 
     res = e->work;
@@ -678,36 +733,33 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     }
 
     if (!e->pilot_locked) {
-        fit_pilot(e->x, count, base, &pamp, &pphase);
+        fit_pilot(e->x, count, sample_base, &pamp, &pphase);
         e->pilot_amp = pamp;
         e->pilot_phase0 = pphase;
         e->pilot_locked = 1;
     } else {
         pphase = e->pilot_phase0;
-        refine_pilot_amp(e->x, count, base, pphase, &pamp);
+        refine_pilot_amp(e->x, count, sample_base, pphase, &pamp);
         e->pilot_amp = pamp;
     }
     pamp = e->pilot_amp;
     pphase = e->pilot_phase0;
     for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(base + i) + (double)pphase;
+        double ph = w19 * (double)(sample_base + i) + (double)pphase;
         float pilot = pamp * (float)sin(ph);
         res[i] = e->x[i] - pilot;
     }
 
-    /* Mono: LP + decimate */
     fir_decimate(&e->fir_mono, fir_lp15, res, count, DEC_AUDIO, &e->phase_mono, mono_d, &n_mono);
 
-    /* Stereo L−R: demod with 2× pilot phase, then LP + decimate */
     for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(base + i) + (double)pphase;
+        double ph = w19 * (double)(sample_base + i) + (double)pphase;
         mix[i] = res[i] * 2.f * (float)sin(2.0 * ph);
     }
     fir_decimate(&e->fir_st, fir_lp15, mix, count, DEC_AUDIO, &e->phase_st, st_d, &n_st);
 
-    /* RDS: demod with 3× pilot phase */
     for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(base + i) + (double)pphase;
+        double ph = w19 * (double)(sample_base + i) + (double)pphase;
         mix[i] = res[i] * 2.f * (float)sin(3.0 * ph);
     }
     fir_decimate(&e->fir_rds, fir_lp25, mix, count, DEC_RDS, &e->phase_rds, rds_d, &n_rds);
@@ -725,22 +777,19 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     }
 
     bitw_init(&w, dst + hdr, dst_cap - hdr);
-    if (bitw_put_f32(&w, pamp) || bitw_put_f32(&w, pphase))
-        return NANOMPX_ERR_OVERFLOW;
-    if (bitw_put(&w, (uint32_t)cfg.rice_stereo, 4) || bitw_put(&w, (uint32_t)cfg.rice_rds, 4))
-        return NANOMPX_ERR_OVERFLOW;
-    if (bitw_put(&w, (uint32_t)n_mono, 16) || bitw_put(&w, (uint32_t)n_st, 16) ||
-        bitw_put(&w, (uint32_t)n_rds, 16))
-        return NANOMPX_ERR_OVERFLOW;
-
-    if (quantize_pred_rice(mono_d, n_mono, cfg.bits_mono, cfg.rice_mono, &w, &e->pred_mono) ||
+    if (bitw_put_f32(&w, pamp) || bitw_put_f32(&w, pphase) ||
+        bitw_put(&w, (uint32_t)cfg.rice_stereo, 4) || bitw_put(&w, (uint32_t)cfg.rice_rds, 4) ||
+        bitw_put(&w, (uint32_t)n_mono, 16) || bitw_put(&w, (uint32_t)n_st, 16) ||
+        bitw_put(&w, (uint32_t)n_rds, 16) ||
+        quantize_pred_rice(mono_d, n_mono, cfg.bits_mono, cfg.rice_mono, &w, &e->pred_mono) ||
         quantize_pred_rice(st_d, n_st, cfg.bits_stereo, cfg.rice_stereo, &w, &e->pred_st) ||
-        quantize_pred_rice(rds_d, n_rds, cfg.bits_rds, cfg.rice_rds, &w, &e->pred_rds))
+        quantize_pred_rice(rds_d, n_rds, cfg.bits_rds, cfg.rice_rds, &w, &e->pred_rds)) {
+        enc_restore(e, &snap);
         return NANOMPX_ERR_OVERFLOW;
+    }
 
     *out_len = hdr + bitw_bytes(&w);
-    e->sample_phase += count;
-    return NANOMPX_OK;
+    return rc;
 }
 
 nanompx_comp_dec_t *nanompx_comp_dec_create(void)
@@ -760,14 +809,13 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
                         nanompx_profile_t profile,
                         const uint8_t *src, size_t src_len,
                         int32_t *samples, size_t max_samples, size_t *out_count,
-                        int keyframe)
+                        int keyframe, uint64_t sample_base)
 {
     size_t count;
     bitr_t r;
     float peak, pamp, pphase;
     size_t i;
     int bits_mono, bits_stereo, bits_rds, rice_mono, rice_stereo, rice_rds;
-    uint64_t base;
     uint32_t tmp;
     size_t n_mono, n_st, n_rds;
     float *mono_d, *st_d, *rds_d, *mono_u, *st_u, *rds_u;
@@ -794,8 +842,7 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
         return NANOMPX_ERR_NOMEM;
 
     if (keyframe)
-        reset_dec_state(d);
-    base = d->sample_phase;
+        nanompx_comp_dec_reset(d);
     w19 = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
 
     mono_d = d->work;
@@ -839,8 +886,7 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
     upsample_fir(&d->fir_rds_i, fir_lp25, rds_d, n_rds, DEC_RDS, &d->phase_rds, rds_u, count);
 
     for (i = 0; i < count; i++) {
-        /* Bands are delayed by CODEC_DELAY; carriers/pilot must match that time. */
-        int64_t ti = (int64_t)base + (int64_t)i - (int64_t)CODEC_DELAY;
+        int64_t ti = (int64_t)sample_base + (int64_t)i - (int64_t)CODEC_DELAY;
         double ph = w19 * (double)ti + (double)pphase;
         float y = mono_u[i] + st_u[i] * (float)sin(2.0 * ph) + rds_u[i] * (float)sin(3.0 * ph) +
                   pamp * (float)sin(ph);
@@ -853,6 +899,5 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
         samples[i] = float_to_pcm24(y);
     }
     *out_count = count;
-    d->sample_phase += count;
     return NANOMPX_OK;
 }

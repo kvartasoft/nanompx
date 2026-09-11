@@ -23,6 +23,7 @@ struct nanompx_decoder {
     uint32_t expect_seq;
     int have_seq;
     nanompx_profile_t last_profile;
+    int wait_keyframe; /* compressed: discard until KEYFRAME after loss */
     nanompx_stats_t stats;
 };
 
@@ -109,7 +110,6 @@ static int decode_payload(nanompx_decoder_t *dec, const nanompx_packet_hdr_t *hd
     }
 
     if (hdr->mode == NANOMPX_MODE_COMPRESSED) {
-        /* Upper bound: payload declares sample count in bytes 2-3 after magic */
         size_t est = 0;
         if (payload_len >= 4)
             est = (size_t)payload[2] | ((size_t)payload[3] << 8);
@@ -118,9 +118,9 @@ static int decode_payload(nanompx_decoder_t *dec, const nanompx_packet_hdr_t *hd
         pcm = (int32_t *)malloc(est * sizeof(int32_t));
         if (!pcm)
             return NANOMPX_ERR_NOMEM;
-        rc = nanompx_comp_decode(dec->comp, (nanompx_profile_t)hdr->profile,
-                                 payload, payload_len, pcm, est, &count,
-                                 (hdr->flags & NANOMPX_FLAG_KEYFRAME) != 0);
+        rc = nanompx_comp_decode(dec->comp, (nanompx_profile_t)hdr->profile, payload,
+                                 payload_len, pcm, est, &count,
+                                 (hdr->flags & NANOMPX_FLAG_KEYFRAME) != 0, hdr->sample_index);
         if (rc != NANOMPX_OK) {
             free(pcm);
             return rc;
@@ -142,6 +142,7 @@ int nanompx_decoder_push_packet(nanompx_decoder_t *dec,
     int32_t *pcm = NULL;
     size_t count = 0;
     int rc;
+    int gap = 0;
 
     if (!dec || !packet)
         return NANOMPX_ERR_INVALID;
@@ -157,19 +158,30 @@ int nanompx_decoder_push_packet(nanompx_decoder_t *dec,
     if (dec->have_seq) {
         uint32_t expect = dec->expect_seq;
         if (hdr.seq != expect) {
-            if ((int32_t)(hdr.seq - expect) > 0)
+            if ((int32_t)(hdr.seq - expect) > 0) {
                 dec->stats.packets_lost += (uint64_t)(hdr.seq - expect);
-            else
+                gap = 1;
+            } else {
                 dec->stats.packets_reorder++;
+            }
         }
     }
     dec->expect_seq = hdr.seq + 1;
     dec->have_seq = 1;
 
     if (hdr.mode == NANOMPX_MODE_COMPRESSED) {
+        if (gap) {
+            /* Predictors / FIRs are useless after a hole — wait for KEYFRAME. */
+            nanompx_comp_dec_reset(dec->comp);
+            dec->wait_keyframe = 1;
+        }
+        if (dec->wait_keyframe && !(hdr.flags & NANOMPX_FLAG_KEYFRAME))
+            return NANOMPX_ERR_AGAIN;
+        if (hdr.flags & NANOMPX_FLAG_KEYFRAME)
+            dec->wait_keyframe = 0;
+
         if (dec->last_profile && dec->last_profile != (nanompx_profile_t)hdr.profile &&
             !(hdr.flags & NANOMPX_FLAG_KEYFRAME) && !(hdr.flags & NANOMPX_FLAG_DISCONTINUITY)) {
-            /* Profile change without keyframe/discontinuity — reject */
             return NANOMPX_ERR_INVALID;
         }
         dec->last_profile = (nanompx_profile_t)hdr.profile;
@@ -196,6 +208,18 @@ int nanompx_decoder_push_packet(nanompx_decoder_t *dec,
     return NANOMPX_OK;
 }
 
+static int64_t frame_due_ns(const nanompx_decoder_t *dec, const queued_frame_t *f)
+{
+    int64_t due =
+        (int64_t)f->hdr.capture_time_ns + dec->network_delay_ns + dec->user_offset_ns;
+    /* Compressed output is late by the filterbank delay relative to capture stamp. */
+    if (f->hdr.mode == NANOMPX_MODE_COMPRESSED) {
+        due -= (int64_t)nanompx_comp_codec_delay_samples() * 1000000000LL /
+               (int64_t)NANOMPX_SAMPLE_RATE;
+    }
+    return due;
+}
+
 static queued_frame_t *earliest_due(nanompx_decoder_t *dec, int64_t now_ns)
 {
     int i;
@@ -206,7 +230,7 @@ static queued_frame_t *earliest_due(nanompx_decoder_t *dec, int64_t now_ns)
         int64_t due;
         if (!f->active)
             continue;
-        due = (int64_t)f->hdr.capture_time_ns + dec->network_delay_ns + dec->user_offset_ns;
+        due = frame_due_ns(dec, f);
         if (dec->sfn_enabled && due > now_ns)
             continue;
         if (!best || f->hdr.capture_time_ns < best_t) {
