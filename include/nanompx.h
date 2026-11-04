@@ -174,6 +174,17 @@ int nanompx_decoder_pull_pcm(nanompx_decoder_t *dec,
                              size_t max_samples,
                              size_t *out_count);
 
+/**
+ * As nanompx_decoder_pull_pcm, as float MPX: 1.0 = 0 dBFS (24-bit full scale).
+ * Not clipped: compressed streams keep peaks over 0 dBFS (an input set too
+ * hot), which pull_pcm has to clip to 24 bits, splattering over the whole
+ * composite. PCM streams are 24-bit on the wire and stay within ±1.0.
+ */
+int nanompx_decoder_pull_float(nanompx_decoder_t *dec,
+                               float *samples,
+                               size_t max_samples,
+                               size_t *out_count);
+
 void nanompx_decoder_get_stats(const nanompx_decoder_t *dec, nanompx_stats_t *out);
 
 /* --- Framing helpers (for custom transports) --- */

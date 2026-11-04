@@ -90,6 +90,10 @@ if(NANOMPX_BUILD_TESTS)
     add_executable(test_compressed tests/unit/test_compressed.c)
     target_link_libraries(test_compressed PRIVATE nanompx)
     add_test(NAME compressed COMMAND test_compressed)
+
+    add_executable(test_overload tests/unit/test_overload.c)
+    target_link_libraries(test_overload PRIVATE nanompx)
+    add_test(NAME overload COMMAND test_overload)
 endif()
 
 install(TARGETS nanompx

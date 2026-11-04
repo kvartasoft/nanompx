@@ -1243,7 +1243,7 @@ static float synth(const nanompx_comp_dec_t *d, int b, int64_t n)
 int nanompx_comp_decode(nanompx_comp_dec_t *d,
                         nanompx_profile_t profile,
                         const uint8_t *src, size_t src_len,
-                        int32_t *samples, size_t max_samples, size_t *out_count,
+                        float *samples, size_t max_samples, size_t *out_count,
                         int keyframe, uint64_t sample_base)
 {
     size_t count, i;
@@ -1337,13 +1337,10 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
 
     for (i = 0; i < count; i++) {
         int64_t n = (int64_t)(sample_base + i) - D_EXTRA;
-        float y = synth(d, 0, n) + synth(d, 1, n) * d->s2[i] + synth(d, 2, n) * d->c3[i] -
-                  synth(d, 3, n) * d->s3[i] + d->pa[i] * d->s1[i];
-        if (y > 1.f)
-            y = 1.f;
-        if (y < -1.f)
-            y = -1.f;
-        samples[i] = (int32_t)lrintf(y * 8388607.f);
+        /* Not clipped: peaks over 0 dBFS reach nanompx_decoder_pull_float
+         * intact; pull_pcm clips them to 24 bits. */
+        samples[i] = synth(d, 0, n) + synth(d, 1, n) * d->s2[i] + synth(d, 2, n) * d->c3[i] -
+                     synth(d, 3, n) * d->s3[i] + d->pa[i] * d->s1[i];
     }
     *out_count = count;
     return NANOMPX_OK;

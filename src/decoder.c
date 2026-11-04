@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 #include "internal.h"
 
+#include <math.h>
+
 #define DEC_Q_MAX 256
 
 typedef struct queued_frame {
     nanompx_packet_hdr_t hdr;
-    int32_t *pcm;
+    float *pcm;              /* 1.0 = 0 dBFS; compressed frames may exceed it */
     size_t count;
     size_t pos;
     int active;
@@ -92,18 +94,27 @@ static queued_frame_t *q_slot(nanompx_decoder_t *dec)
 
 static int decode_payload(nanompx_decoder_t *dec, const nanompx_packet_hdr_t *hdr,
                           const uint8_t *payload, size_t payload_len,
-                          int32_t **out_pcm, size_t *out_count)
+                          float **out_pcm, size_t *out_count)
 {
-    int32_t *pcm;
-    size_t count = 0;
+    float *pcm;
+    size_t count = 0, i;
     int rc;
 
     if (hdr->mode == NANOMPX_MODE_PCM) {
+        int32_t *raw;
+
         count = payload_len / 3;
-        pcm = (int32_t *)malloc(count * sizeof(int32_t));
-        if (!pcm)
+        pcm = (float *)malloc(count * sizeof(float));
+        raw = (int32_t *)malloc(count * sizeof(int32_t));
+        if (!pcm || !raw) {
+            free(pcm);
+            free(raw);
             return NANOMPX_ERR_NOMEM;
-        nanompx_pcm_decode(payload, payload_len, pcm, count);
+        }
+        nanompx_pcm_decode(payload, payload_len, raw, count);
+        for (i = 0; i < count; i++)
+            pcm[i] = (float)raw[i] / 8388607.f;
+        free(raw);
         *out_pcm = pcm;
         *out_count = count;
         return NANOMPX_OK;
@@ -115,7 +126,7 @@ static int decode_payload(nanompx_decoder_t *dec, const nanompx_packet_hdr_t *hd
             est = (size_t)payload[2] | ((size_t)payload[3] << 8);
         if (est == 0 || est > 65535)
             return NANOMPX_ERR_INVALID;
-        pcm = (int32_t *)malloc(est * sizeof(int32_t));
+        pcm = (float *)malloc(est * sizeof(float));
         if (!pcm)
             return NANOMPX_ERR_NOMEM;
         rc = nanompx_comp_decode(dec->comp, (nanompx_profile_t)hdr->profile, payload,
@@ -139,7 +150,7 @@ int nanompx_decoder_push_packet(nanompx_decoder_t *dec,
 {
     nanompx_packet_hdr_t hdr;
     queued_frame_t *slot;
-    int32_t *pcm = NULL;
+    float *pcm = NULL;
     size_t count = 0;
     int rc;
     int gap = 0;
@@ -241,16 +252,15 @@ static queued_frame_t *earliest_due(nanompx_decoder_t *dec, int64_t now_ns)
     return best;
 }
 
-int nanompx_decoder_pull_pcm(nanompx_decoder_t *dec,
-                             int32_t *samples,
-                             size_t max_samples,
-                             size_t *out_count)
+/* The next due samples as float (1.0 = 0 dBFS), or 24-bit when pcm is set. */
+static int pull(nanompx_decoder_t *dec, float *fsamples, int32_t *pcm,
+                size_t max_samples, size_t *out_count)
 {
     queued_frame_t *f;
     int64_t now = 0;
     size_t n;
 
-    if (!dec || !samples || !out_count)
+    if (!dec || (!fsamples && !pcm) || !out_count)
         return NANOMPX_ERR_INVALID;
     *out_count = 0;
 
@@ -268,7 +278,19 @@ int nanompx_decoder_pull_pcm(nanompx_decoder_t *dec,
     n = f->count - f->pos;
     if (n > max_samples)
         n = max_samples;
-    memcpy(samples, f->pcm + f->pos, n * sizeof(int32_t));
+    if (fsamples) {
+        memcpy(fsamples, f->pcm + f->pos, n * sizeof(float));
+    } else {
+        size_t i;
+        for (i = 0; i < n; i++) {
+            float y = f->pcm[f->pos + i];
+            if (y > 1.f)
+                y = 1.f;
+            if (y < -1.f)
+                y = -1.f;
+            pcm[i] = (int32_t)lrintf(y * 8388607.f);
+        }
+    }
     f->pos += n;
     *out_count = n;
     dec->stats.samples_decoded += n;
@@ -284,6 +306,22 @@ int nanompx_decoder_pull_pcm(nanompx_decoder_t *dec,
         dec->stats.buffer_depth_packets = (uint32_t)dec->q_count;
     }
     return NANOMPX_OK;
+}
+
+int nanompx_decoder_pull_pcm(nanompx_decoder_t *dec,
+                             int32_t *samples,
+                             size_t max_samples,
+                             size_t *out_count)
+{
+    return samples ? pull(dec, NULL, samples, max_samples, out_count) : NANOMPX_ERR_INVALID;
+}
+
+int nanompx_decoder_pull_float(nanompx_decoder_t *dec,
+                               float *samples,
+                               size_t max_samples,
+                               size_t *out_count)
+{
+    return samples ? pull(dec, samples, NULL, max_samples, out_count) : NANOMPX_ERR_INVALID;
 }
 
 void nanompx_decoder_get_stats(const nanompx_decoder_t *dec, nanompx_stats_t *out)
