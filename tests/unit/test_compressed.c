@@ -19,7 +19,7 @@ static int fail(const char *msg)
 /* Band-weighted metrics: mono/stereo matter for FM; flat MPX SNR does not. */
 static double band_energy(const double *x, unsigned n, double f0, double f1)
 {
-    /* Goertzel-ish power via DFT bins over [f0,f1] — rectangular, fine for gates */
+    /* DFT bin power over [f0,f1] by Goertzel — rectangular, fine for gates */
     unsigned k0, k1, k, i;
     double e = 0.0;
     k0 = (unsigned)(f0 * (double)n / (double)NANOMPX_SAMPLE_RATE);
@@ -29,13 +29,13 @@ static double band_energy(const double *x, unsigned n, double f0, double f1)
     if (k1 < k0)
         return 0.0;
     for (k = k0; k <= k1; k++) {
-        double re = 0.0, im = 0.0;
-        double w = 2.0 * M_PI * (double)k / (double)n;
+        double c = 2.0 * cos(2.0 * M_PI * (double)k / (double)n), s1 = 0.0, s2 = 0.0;
         for (i = 0; i < n; i++) {
-            re += x[i] * cos(w * (double)i);
-            im -= x[i] * sin(w * (double)i);
+            double s0 = x[i] + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
         }
-        e += re * re + im * im;
+        e += s1 * s1 + s2 * s2 - c * s1 * s2;
     }
     return e;
 }
@@ -45,8 +45,8 @@ static double snr_db(double sig, double err)
     return 10.0 * log10((sig + 1e-20) / (err + 1e-20));
 }
 
-static int test_profile(nanompx_profile_t profile, const char *name,
-                        double min_mono_db, double min_stereo_db, double min_weighted_db)
+static int test_rate(unsigned kbps, const char *name,
+                     double min_mono_db, double min_stereo_db, double min_weighted_db)
 {
     const unsigned n = NANOMPX_DEFAULT_FRAME_SAMPLES * 60;
     int32_t *in;
@@ -93,7 +93,8 @@ static int test_profile(nanompx_profile_t profile, const char *name,
     nanompx_encoder_set_clock(enc, clk);
     nanompx_decoder_set_clock(dec, clk);
     nanompx_encoder_set_mode(enc, NANOMPX_MODE_COMPRESSED);
-    nanompx_encoder_set_profile(enc, profile);
+    if (nanompx_encoder_set_bitrate(enc, kbps) != NANOMPX_OK)
+        return fail("set_bitrate");
     nanompx_decoder_set_sfn_enabled(dec, 0);
 
     if (nanompx_encoder_push_pcm(enc, in, n, pkt, pkt_cap, &wrote) != NANOMPX_OK)
@@ -105,8 +106,8 @@ static int test_profile(nanompx_profile_t profile, const char *name,
         size_t got = 0;
         if (nanompx_hdr_unpack(&hdr, pkt + off) != NANOMPX_OK)
             return fail("hdr");
-        if (hdr.mode != NANOMPX_MODE_COMPRESSED || hdr.profile != (uint8_t)profile)
-            return fail("profile mismatch on wire");
+        if (hdr.mode != NANOMPX_MODE_COMPRESSED || hdr.profile != (uint8_t)(kbps / 8))
+            return fail("bitrate mismatch on wire");
         plen = NANOMPX_HDR_SIZE + hdr.payload_len;
         if (nanompx_decoder_push_packet(dec, pkt + off, plen) != NANOMPX_OK)
             return fail("push");
@@ -142,7 +143,7 @@ static int test_profile(nanompx_profile_t profile, const char *name,
         raw_err = 0.0;
         for (i = 0; i + best_lag < n; i++)
             raw_err += err[i] * err[i];
-        fprintf(stderr, "profile %s: align_lag=%u samples\n", name, best_lag);
+        fprintf(stderr, "%s kbps: align_lag=%u samples\n", name, best_lag);
     }
 
     /* Skip settle + use aligned error */
@@ -168,7 +169,7 @@ static int test_profile(nanompx_profile_t profile, const char *name,
 
     bps = (double)wrote * 8.0 * ((double)NANOMPX_SAMPLE_RATE / (double)n);
     fprintf(stderr,
-            "profile %s: ~%.0f bps | mono=%.1f stereo=%.1f rds=%.1f "
+            "%s kbps: ~%.0f bps | mono=%.1f stereo=%.1f rds=%.1f "
             "weighted=%.1f raw_mpx=%.1f dB | peak_in=%.3f peak_out=%.3f\n",
             name, bps, mono_snr, st_snr, rds_snr, weighted, raw_snr, peak_in, peak_out);
 
@@ -197,17 +198,37 @@ static int test_profile(nanompx_profile_t profile, const char *name,
     return 0;
 }
 
+/* The former profiles are bitrates, and out-of-range rates are refused. */
+static int test_api(void)
+{
+    nanompx_encoder_t *enc = nanompx_encoder_create();
+    uint8_t pkt[65536];
+    int32_t pcm[NANOMPX_DEFAULT_FRAME_SAMPLES] = { 0 };
+    nanompx_packet_hdr_t hdr;
+    size_t wrote = 0;
+    nanompx_encoder_set_mode(enc, NANOMPX_MODE_COMPRESSED);
+    if (nanompx_encoder_set_bitrate(enc, NANOMPX_KBPS_MIN - 1) == NANOMPX_OK ||
+        nanompx_encoder_set_bitrate(enc, NANOMPX_KBPS_MAX + 1) == NANOMPX_OK)
+        return fail("bitrate range");
+    if (nanompx_encoder_set_profile(enc, NANOMPX_PROFILE_M) != NANOMPX_OK ||
+        nanompx_encoder_push_pcm(enc, pcm, NANOMPX_DEFAULT_FRAME_SAMPLES, pkt, sizeof(pkt),
+                                 &wrote) != NANOMPX_OK ||
+        nanompx_hdr_unpack(&hdr, pkt) != NANOMPX_OK || hdr.profile != 256 / 8)
+        return fail("profile M as 256 kbps");
+    nanompx_encoder_destroy(enc);
+    return 0;
+}
+
 int main(void)
 {
-    /* Gates are band-weighted (fairer than flat MPX waveform SNR). */
-    /* Gates reflect band-weighted FM quality (not flat MPX SNR).
-     * Filterbank PR ceilings ~40 dB on synthetic MPX; profiles allocate bits. */
-    if (test_profile(NANOMPX_PROFILE_L, "L", 55.0, 50.0, 50.0))
+    /* Gates reflect band-weighted FM quality (not flat MPX SNR). */
+    if (test_api())
         return 1;
-    if (test_profile(NANOMPX_PROFILE_M, "M", 50.0, 45.0, 45.0))
+    if (test_rate(384, "384", 55.0, 50.0, 50.0) || test_rate(320, "320", 55.0, 50.0, 50.0) ||
+        test_rate(256, "256", 50.0, 45.0, 45.0) || test_rate(192, "192", 40.0, 36.0, 36.0) ||
+        test_rate(160, "160", 36.0, 32.0, 32.0) ||
+        test_rate(512, "512", 60.0, 55.0, 55.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_S, "S", 40.0, 36.0, 36.0))
-        return 1;
-    printf("Compressed L/M/S OK (FM band metrics)\n");
+    printf("Compressed bitrates OK (FM band metrics)\n");
     return 0;
 }

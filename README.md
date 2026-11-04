@@ -7,7 +7,7 @@ GPS/1PPS SFN synchronization.
 - Project site: [www.kvarta.net](https://www.kvarta.net)
 - License: **MIT**
 - Sample rate: **192 kHz / 24-bit**
-- Modes: **PCM** (reference quality) and **COMPRESSED** profiles **L / M / S**
+- Modes: **PCM** (reference quality) and **COMPRESSED**, 128–1024 kbps
 - Protocol: open — see [docs/PROTOCOL.md](docs/PROTOCOL.md)
 
 NanoMPX is inspired by the problem space of products like MicroMPX, but it is an
@@ -52,7 +52,7 @@ The reference tree can also pick up headers from a sibling `../kunix/libsrt`.
 ```bash
 # Raw s24le mono @ 192 kHz
 ./build/nanompx_cli encode --mode pcm -i in.s24 -o out.nmpx
-./build/nanompx_cli encode --mode comp --profile M -i in.s24 -o out.nmpx
+./build/nanompx_cli encode --mode comp --bitrate 256 -i in.s24 -o out.nmpx
 ./build/nanompx_cli decode --sfn 0 -i out.nmpx -o out.s24
 ./build/nanompx_cli roundtrip --mode pcm -i in.s24
 ```
@@ -64,7 +64,7 @@ The reference tree can also pick up headers from a sibling `../kunix/libsrt`.
 
 nanompx_encoder_t *enc = nanompx_encoder_create();
 nanompx_encoder_set_mode(enc, NANOMPX_MODE_COMPRESSED);
-nanompx_encoder_set_profile(enc, NANOMPX_PROFILE_L);
+nanompx_encoder_set_bitrate(enc, 320);
 nanompx_encoder_set_clock(enc, nanompx_clock_gps_create("/dev/ttyUSB0", "/dev/pps0"));
 /* nanompx_encoder_push_pcm(...) -> framed packets */
 ```

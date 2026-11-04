@@ -19,9 +19,10 @@ size_t nanompx_pcm_decode(const uint8_t *src, size_t src_len,
 typedef struct nanompx_comp_enc nanompx_comp_enc_t;
 typedef struct nanompx_comp_dec nanompx_comp_dec_t;
 
-nanompx_comp_enc_t *nanompx_comp_enc_create(nanompx_profile_t profile);
+/** kbps: whole packets, with overhead bytes of the caller's header in each. */
+nanompx_comp_enc_t *nanompx_comp_enc_create(unsigned kbps, unsigned overhead);
 void nanompx_comp_enc_destroy(nanompx_comp_enc_t *e);
-int nanompx_comp_enc_set_profile(nanompx_comp_enc_t *e, nanompx_profile_t profile);
+int nanompx_comp_enc_set_bitrate(nanompx_comp_enc_t *e, unsigned kbps, unsigned overhead);
 /** Algorithmic delay (samples) of compressed encode→decode path. */
 unsigned nanompx_comp_codec_delay_samples(void);
 int nanompx_comp_encode(nanompx_comp_enc_t *e,

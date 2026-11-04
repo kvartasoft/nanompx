@@ -540,28 +540,33 @@ static float tune(const char *name, int b, float def)
 #define tune(name, b, def) (def)
 #endif
 
-/* Bitrate per profile (kbps): the encoder spends it, easing the noise targets
+/* Rate control: the encoder spends its bitrate, easing the noise targets
  * when content is dense and tightening them (up to RATE_TIGHT_MAX dB) when it
  * is light. A leaky bucket: 1 dB per RATE_DB_BITS of debt or credit. */
 #ifndef RATE_DB_BITS
 #define RATE_DB_BITS 3000.0
 #endif
-#define RATE_EASE_MAX 24.0
+#ifndef RATE_EASE_MAX
+#define RATE_EASE_MAX 60.0       /* enough to hold the rate on full-scale noise */
+#endif
 #define RATE_TIGHT_MAX 6.0
 
-static double profile_kbps(nanompx_profile_t p)
+static float clampf(float v, float lo, float hi)
 {
-    double k = p == NANOMPX_PROFILE_L ? 316.0 : p == NANOMPX_PROFILE_M ? 256.0 : 192.0;
-    return tune("NMPX_KBPS", 0, (float)k);
+    return v < lo ? lo : v > hi ? hi : v;
 }
 
-static quality_t profile_quality(nanompx_profile_t p)
+/* Starting targets for a payload bitrate (kbps), where the rate control
+ * lands with the least easing: about 1 dB per 10 kbps of audio, and RDS a
+ * little coarser at low rates (its floor keeps it decodable) and cleaner at
+ * high ones, where it costs little (+10 dB for about 6 kbps). */
+static quality_t rate_quality(double kbps)
 {
-    /*                          floor          rel                smr                spread     pct */
-    static const quality_t L = { { 0, 0, -50 }, { 66, 62, -100 }, { -100, -100, 12 }, { 0, 0, 0 }, { 0, 0, 0 } };
-    static const quality_t M = { { 0, 0, -49 }, { 60, 56, -100 }, { -100, -100, 10 }, { 0, 0, 0 }, { 0, 0, 0 } };
-    static const quality_t S = { { 0, 0, -48 }, { 54, 50, -100 }, { -100, -100, 8 }, { 0, 0, 0 }, { 0, 0, 0 } };
-    quality_t q = p == NANOMPX_PROFILE_L ? L : p == NANOMPX_PROFILE_M ? M : S;
+    float rel = clampf((float)(66.0 + 0.1 * (kbps - 316.0)), 30.f, 90.f);
+    float smr = clampf((float)(12.0 + (kbps - 316.0) / 24.0), 4.f, 14.f);
+    float rds = clampf((float)(-50.0 - (kbps - 200.0) / 24.0), -66.f, -50.f);
+    /*             floor           rel                   smr                 spread     pct */
+    quality_t q = { { 0, 0, rds }, { rel, rel - 4, -100 }, { -100, -100, smr }, { 0, 0, 0 }, { 0, 0, 0 } };
     int b;
     for (b = 0; b < 3; b++) {
         q.floor_db[b] = tune("NMPX_FLOOR", b, q.floor_db[b]);
@@ -868,7 +873,10 @@ static int pilot_get(rc_dec_t *r, pilot_tx_t *t, uint64_t base, size_t count,
 /* --- encoder -------------------------------------------------------------- */
 
 struct nanompx_comp_enc {
-    nanompx_profile_t profile;
+    unsigned kbps;              /* whole packets, the caller's header included */
+    unsigned overhead;          /* caller's header bytes per packet */
+    quality_t q;                /* starting targets for the payload bitrate */
+    size_t q_count;             /* the packet length q was set for */
     float *in[NBANDS];          /* band inputs: NF-1 samples of history, then the frame */
     size_t cap;
     float *s2, *c3, *s3, *x;
@@ -912,7 +920,7 @@ static int ensure_enc(nanompx_comp_enc_t *e, size_t n)
     return 0;
 }
 
-nanompx_comp_enc_t *nanompx_comp_enc_create(nanompx_profile_t profile)
+nanompx_comp_enc_t *nanompx_comp_enc_create(unsigned kbps, unsigned overhead)
 {
     nanompx_comp_enc_t *e = (nanompx_comp_enc_t *)calloc(1, sizeof(*e));
     int b;
@@ -926,9 +934,7 @@ nanompx_comp_enc_t *nanompx_comp_enc_create(nanompx_profile_t profile)
             return NULL;
         }
     }
-    if (profile < NANOMPX_PROFILE_L || profile > NANOMPX_PROFILE_S)
-        profile = NANOMPX_PROFILE_L;
-    e->profile = profile;
+    nanompx_comp_enc_set_bitrate(e, kbps, overhead);
     return e;
 }
 
@@ -945,11 +951,15 @@ void nanompx_comp_enc_destroy(nanompx_comp_enc_t *e)
     free(e);
 }
 
-int nanompx_comp_enc_set_profile(nanompx_comp_enc_t *e, nanompx_profile_t profile)
+int nanompx_comp_enc_set_bitrate(nanompx_comp_enc_t *e, unsigned kbps, unsigned overhead)
 {
-    if (!e || profile < NANOMPX_PROFILE_L || profile > NANOMPX_PROFILE_S)
+    if (!e || kbps < NANOMPX_KBPS_MIN || kbps > NANOMPX_KBPS_MAX)
         return NANOMPX_ERR_INVALID;
-    e->profile = profile;
+    e->kbps = (unsigned)tune("NMPX_KBPS", 0, (float)kbps);
+    e->overhead = overhead;
+    e->q_count = 0;
+    e->debt = 0.0;
+    e->ease = 0.f;
     return NANOMPX_OK;
 }
 
@@ -990,7 +1000,7 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
                         uint8_t *dst, size_t dst_cap, size_t *out_len,
                         int keyframe, uint64_t sample_base)
 {
-    quality_t ql = profile_quality(e ? e->profile : NANOMPX_PROFILE_L);
+    quality_t ql;
     float ease = e ? e->ease : 0.f;
     rc_enc_t rc;
     double phi, wv, amp, err;
@@ -999,6 +1009,12 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
 
     if (!e || !samples || !dst || !out_len || count == 0 || count > 65535)
         return NANOMPX_ERR_INVALID;
+    if (e->q_count != count) {
+        /* the payload's share: the caller's header is spent per packet */
+        e->q = rate_quality(e->kbps - e->overhead * 8.0 * NANOMPX_SAMPLE_RATE / (double)count / 1000.0);
+        e->q_count = count;
+    }
+    ql = e->q;
     if (ensure_enc(e, count) != 0)
         return NANOMPX_ERR_NOMEM;
     if (dst_cap < HDR_BYTES + 32)
@@ -1019,7 +1035,7 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     pilot_measure(e->x, count, phi, wv, &amp, &err);
 
     dst[0] = COMP_MAGIC;
-    dst[1] = (uint8_t)e->profile;
+    dst[1] = (uint8_t)(e->kbps / 8);
     dst[2] = (uint8_t)(count & 0xff);
     dst[3] = (uint8_t)((count >> 8) & 0xff);
     rce_init(&rc, dst + HDR_BYTES, dst_cap - HDR_BYTES);
@@ -1098,9 +1114,8 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
     *out_len = HDR_BYTES + rc.pos;
     {
         /* Rate: a leaky bucket of debt (over budget) or credit (under). */
-        double budget = profile_kbps(e->profile) * 1000.0 * (double)count /
-                        (double)NANOMPX_SAMPLE_RATE;
-        e->debt += 8.0 * (double)*out_len - budget;
+        double budget = e->kbps * 1000.0 * (double)count / (double)NANOMPX_SAMPLE_RATE;
+        e->debt += 8.0 * (double)(*out_len + e->overhead) - budget;
         if (e->debt < -RATE_TIGHT_MAX * RATE_DB_BITS)
             e->debt = -RATE_TIGHT_MAX * RATE_DB_BITS;
         if (e->debt > RATE_EASE_MAX * RATE_DB_BITS)

@@ -30,7 +30,7 @@ All multi-byte integer fields are **little-endian**.
 | 0 | 4 | `magic` | `0x58504D4E` (“NMPX”) |
 | 4 | 1 | `version` | Protocol version (`1`) |
 | 5 | 1 | `mode` | `0` = PCM, `1` = COMPRESSED |
-| 6 | 1 | `profile` | `0` none/PCM; `1`=L, `2`=M, `3`=S |
+| 6 | 1 | `profile` | `0` PCM; compressed: bitrate in 8 kbps steps (`40` = 320 kbps); `1`–`3` from older encoders |
 | 7 | 1 | `flags` | bit0 keyframe, bit1 discontinuity, bit2 FEC |
 | 8 | 4 | `seq` | monotonically increasing sequence number |
 | 12 | 8 | `sample_index` | index of first sample in this frame |
@@ -44,7 +44,7 @@ Receivers **must** drop packets with bad magic, unsupported version, or bad `hdr
 
 | Bit | Name | Meaning |
 |-----|------|---------|
-| 0 | KEYFRAME | Independent frame; required after mode/profile change |
+| 0 | KEYFRAME | Independent frame; required after mode/bitrate change |
 | 1 | DISCONTINUITY | Timeline break |
 | 2 | FEC | Payload is FEC parity (reserved; ignore if unsupported) |
 
@@ -63,7 +63,7 @@ FM band transform codec, payload magic `0xC6` (v6). Reference implementation:
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 1 | `0xC6` compressed magic (v6) |
-| 1 | 1 | profile (L/M/S) |
+| 1 | 1 | bitrate in 8 kbps steps (informative) |
 | 2 | 2 | `n_samples` (little-endian) |
 | 4 | … | range-coded body (trailing zero bytes may be omitted) |
 
@@ -99,26 +99,41 @@ Processing model:
    6 kHz (bins to 2.6 kHz).
 4. Quantiser steps: audio bands are coded for least squared error, one noise
    level per block set relative to the block's power; RDS keeps its noise
-   under a floor and below the local signal. A rate control in the encoder
-   holds the profile's bitrate by moving these targets (encoder-only).
+   under a floor and below the local signal. The starting targets follow the
+   bitrate, and a rate control in the encoder holds it by moving them
+   (encoder-only).
 5. Decoder: inverse MDCT with overlap-add, matched upsampling filters,
    remodulation with θ, regenerated pilot.
 
 Codec delay: 576 (filters) + 4096 (MDCT) = 4672 samples (24.3 ms).
 
-#### Profiles
+#### Bitrate
 
-| Profile | ID | Bitrate (steady state) |
-|---------|----|------------------------|
-| L (Large) | 1 | ≈316 kbps |
-| M (Medium) | 2 | ≈256 kbps |
-| S (Small) | 3 | ≈192 kbps |
+The encoder is set to a bitrate, 128–1024 kbps (`nanompx_encoder_set_bitrate`),
+which counts whole NanoMPX packets, the 32-byte header included (26 kbps at
+10 ms packets). The decoder needs no setting. The former profiles are
+bitrates: L = 320, M = 256, S = 192 kbps (`nanompx_encoder_set_profile`).
+
+Measured band SNR, mono / stereo / RDS in dB, 10 ms packets, steady state
+(programme: processed music; synthetic: tones, stereo and RDS test MPX):
+
+| kbps | Programme | Synthetic |
+|------|-----------|-----------|
+| 160 | 46 / 42 / 23 | 31 / 28 / 24 |
+| 192 | 52 / 48 / 23 | 36 / 32 / 24 |
+| 256 | 61 / 57 / 24 | 44 / 40 / 25 |
+| 320 | 67 / 63 / 27 | 49 / 46 / 28 |
+| 384 | 72 / 68 / 29 | 55 / 51 / 30 |
+| 512 | 79 / 76 / 34 | 64 / 58 / 36 |
+
+Below about 160 kbps the header and RDS (about 20 kbps) leave too little for
+the audio.
 
 Quality should be judged with **band-weighted** metrics (mono/stereo/RDS),
 not flat full-MPX waveform SNR, which weights the stop bands the codec
 deliberately discards.
 
-Profile is present in **every** packet header. Switching profile requires `KEYFRAME` or `DISCONTINUITY`.
+The bitrate is in **every** packet header. Changing it requires `KEYFRAME` or `DISCONTINUITY`.
 
 Peak control: decoders must not emit samples whose absolute level exceeds the encoded
 frame peak (soft limit). Encoders must not invent overshoots above the source frame peak.
@@ -148,9 +163,8 @@ See [SFN.md](SFN.md).
 ## Versioning
 
 - `version` increments on breaking header changes.
-- Compressed payload magic/layout may evolve with new profile IDs without bumping
-  protocol version if old profiles remain decodable.
-- Reserved profile IDs `4…255` for future profiles (e.g. XS).
+- Compressed payload magic/layout may evolve without bumping protocol version
+  if old payloads remain decodable.
 
 ## Conformance
 
@@ -158,5 +172,5 @@ Reference vectors live under `tests/vectors/`. A conforming implementation must:
 
 1. Accept PCM mode packets and reconstruct bit-exact s24le samples.
 2. Parse headers and reject CRC failures.
-3. Decode L/M/S compressed profiles produced by the reference encoder (within documented quality).
+3. Decode compressed packets of any bitrate produced by the reference encoder (within documented quality).
 4. Honor `capture_time_ns` when SFN mode is enabled.

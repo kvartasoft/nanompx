@@ -17,15 +17,16 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "NanoMPX %s\n"
             "Usage:\n"
-            "  %s encode [--mode pcm|comp] [--profile L|M|S] [-i in.s24] [-o out.nmpx]\n"
+            "  %s encode [--mode pcm|comp] [--bitrate KBPS] [-i in.s24] [-o out.nmpx]\n"
             "  %s decode [--sfn 0|1] [--delay-ms N] [-i in.nmpx] [-o out.s24]\n"
-            "  %s roundtrip [--mode pcm|comp] [--profile L|M|S] [-i in.s24]\n"
+            "  %s roundtrip [--mode pcm|comp] [--bitrate KBPS] [-i in.s24]\n"
 #if NANOMPX_WITH_SRT
-            "  %s srt-send --host H --port P [--mode pcm|comp] [--profile L|M|S] [-i in.s24]\n"
+            "  %s srt-send --host H --port P [--mode pcm|comp] [--bitrate KBPS] [-i in.s24]\n"
             "  %s srt-recv --host H --port P [--listener] [-o out.s24]\n"
 #endif
             "\n"
-            "Raw PCM is signed 24-bit little-endian mono @ 192000 Hz (3 bytes/sample).\n",
+            "Raw PCM is signed 24-bit little-endian mono @ 192000 Hz (3 bytes/sample).\n"
+            "--bitrate: compressed kbps, 128..1024 (default 320; --profile L|M|S is 320|256|192).\n",
             nanompx_version_string(), argv0, argv0, argv0
 #if NANOMPX_WITH_SRT
             ,
@@ -34,17 +35,18 @@ static void usage(const char *argv0)
     );
 }
 
-static nanompx_profile_t parse_profile(const char *s)
+/* kbps, or a former profile letter: L 320, M 256, S 192 */
+static unsigned parse_bitrate(const char *s)
 {
     if (!s)
-        return NANOMPX_PROFILE_L;
-    if (s[0] == 'L' || s[0] == 'l')
-        return NANOMPX_PROFILE_L;
+        return NANOMPX_KBPS_DEFAULT;
     if (s[0] == 'M' || s[0] == 'm')
-        return NANOMPX_PROFILE_M;
+        return 256;
     if (s[0] == 'S' || s[0] == 's')
-        return NANOMPX_PROFILE_S;
-    return NANOMPX_PROFILE_L;
+        return 192;
+    if (s[0] >= '0' && s[0] <= '9')
+        return (unsigned)atoi(s);
+    return NANOMPX_KBPS_DEFAULT;
 }
 
 static int read_all(const char *path, uint8_t **out, size_t *out_len)
@@ -127,7 +129,7 @@ static int cmd_encode(int argc, char **argv)
     const char *in_path = "in.s24";
     const char *out_path = "out.nmpx";
     nanompx_mode_t mode = NANOMPX_MODE_PCM;
-    nanompx_profile_t profile = NANOMPX_PROFILE_L;
+    unsigned kbps = NANOMPX_KBPS_DEFAULT;
     uint8_t *raw = NULL;
     size_t raw_len = 0;
     int32_t *pcm = NULL;
@@ -142,8 +144,9 @@ static int cmd_encode(int argc, char **argv)
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             mode = (!strcmp(argv[++i], "comp")) ? NANOMPX_MODE_COMPRESSED : NANOMPX_MODE_PCM;
-        } else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
-            profile = parse_profile(argv[++i]);
+        } else if ((!strcmp(argv[i], "--bitrate") || !strcmp(argv[i], "--profile")) &&
+                   i + 1 < argc) {
+            kbps = parse_bitrate(argv[++i]);
         } else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
             in_path = argv[++i];
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
@@ -168,8 +171,12 @@ static int cmd_encode(int argc, char **argv)
     clk = nanompx_clock_host_create();
     nanompx_encoder_set_clock(enc, clk);
     nanompx_encoder_set_mode(enc, mode);
-    if (mode == NANOMPX_MODE_COMPRESSED)
-        nanompx_encoder_set_profile(enc, profile);
+    if (mode == NANOMPX_MODE_COMPRESSED &&
+        nanompx_encoder_set_bitrate(enc, kbps) != NANOMPX_OK) {
+        fprintf(stderr, "bitrate %u kbps out of range (%u..%u)\n", kbps, NANOMPX_KBPS_MIN,
+                NANOMPX_KBPS_MAX);
+        return 1;
+    }
 
     out_cap = n_samp * 4 + 65536;
     out = (uint8_t *)malloc(out_cap);
@@ -207,9 +214,8 @@ static int cmd_encode(int argc, char **argv)
     if (write_all(out_path, out, out_len) != 0)
         fprintf(stderr, "failed to write %s\n", out_path);
     else
-        fprintf(stderr, "encoded %zu samples -> %zu bytes (%s profile=%d)\n",
-                produced, out_len, mode == NANOMPX_MODE_PCM ? "pcm" : "comp",
-                (int)profile);
+        fprintf(stderr, "encoded %zu samples -> %zu bytes (%s %u kbps)\n",
+                produced, out_len, mode == NANOMPX_MODE_PCM ? "pcm" : "comp", kbps);
 
     free(out);
     free(pcm);
@@ -313,18 +319,19 @@ static int cmd_decode(int argc, char **argv)
 static int cmd_roundtrip(int argc, char **argv)
 {
     const char *in_path = "in.s24";
-    char *tmp_argv_enc[] = { "--mode", "pcm", "--profile", "L", "-i", NULL, "-o", "roundtrip.nmpx" };
+    char *tmp_argv_enc[] = { "--mode", "pcm", "--bitrate", "320", "-i", NULL, "-o", "roundtrip.nmpx" };
     char *tmp_argv_dec[] = { "--sfn", "0", "-i", "roundtrip.nmpx", "-o", "roundtrip.s24" };
     nanompx_mode_t mode = NANOMPX_MODE_PCM;
-    nanompx_profile_t profile = NANOMPX_PROFILE_L;
+    unsigned kbps = NANOMPX_KBPS_DEFAULT;
     int i;
     int rc;
 
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             mode = (!strcmp(argv[++i], "comp")) ? NANOMPX_MODE_COMPRESSED : NANOMPX_MODE_PCM;
-        } else if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
-            profile = parse_profile(argv[++i]);
+        } else if ((!strcmp(argv[i], "--bitrate") || !strcmp(argv[i], "--profile")) &&
+                   i + 1 < argc) {
+            kbps = parse_bitrate(argv[++i]);
         } else if (!strcmp(argv[i], "-i") && i + 1 < argc) {
             in_path = argv[++i];
         }
@@ -332,13 +339,8 @@ static int cmd_roundtrip(int argc, char **argv)
 
     {
         char mode_s[8];
-        char prof_s[2] = { (char)('L' + (profile - 1)), 0 };
-        if (profile == NANOMPX_PROFILE_L)
-            prof_s[0] = 'L';
-        else if (profile == NANOMPX_PROFILE_M)
-            prof_s[0] = 'M';
-        else
-            prof_s[0] = 'S';
+        char prof_s[12];
+        snprintf(prof_s, sizeof(prof_s), "%u", kbps);
         snprintf(mode_s, sizeof(mode_s), "%s", mode == NANOMPX_MODE_PCM ? "pcm" : "comp");
         tmp_argv_enc[1] = mode_s;
         tmp_argv_enc[3] = prof_s;
@@ -380,7 +382,7 @@ static int cmd_srt_send(int argc, char **argv)
     int port = 9000;
     const char *in_path = "in.s24";
     nanompx_mode_t mode = NANOMPX_MODE_PCM;
-    nanompx_profile_t profile = NANOMPX_PROFILE_L;
+    unsigned kbps = NANOMPX_KBPS_DEFAULT;
     nanompx_srt_config_t cfg;
     nanompx_srt_t *srt;
     nanompx_encoder_t *enc;
@@ -400,8 +402,9 @@ static int cmd_srt_send(int argc, char **argv)
             in_path = argv[++i];
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc)
             mode = (!strcmp(argv[++i], "comp")) ? NANOMPX_MODE_COMPRESSED : NANOMPX_MODE_PCM;
-        else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
-            profile = parse_profile(argv[++i]);
+        else if ((!strcmp(argv[i], "--bitrate") || !strcmp(argv[i], "--profile")) &&
+                 i + 1 < argc)
+            kbps = parse_bitrate(argv[++i]);
     }
 
     if (nanompx_srt_startup() != 0) {
@@ -435,8 +438,12 @@ static int cmd_srt_send(int argc, char **argv)
     clk = nanompx_clock_host_create();
     nanompx_encoder_set_clock(enc, clk);
     nanompx_encoder_set_mode(enc, mode);
-    if (mode == NANOMPX_MODE_COMPRESSED)
-        nanompx_encoder_set_profile(enc, profile);
+    if (mode == NANOMPX_MODE_COMPRESSED &&
+        nanompx_encoder_set_bitrate(enc, kbps) != NANOMPX_OK) {
+        fprintf(stderr, "bitrate %u kbps out of range (%u..%u)\n", kbps, NANOMPX_KBPS_MIN,
+                NANOMPX_KBPS_MAX);
+        return 1;
+    }
 
     while (off < n_samp) {
         size_t chunk = n_samp - off;

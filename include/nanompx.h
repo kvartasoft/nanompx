@@ -28,12 +28,18 @@ typedef enum nanompx_mode {
     NANOMPX_MODE_COMPRESSED = 1
 } nanompx_mode_t;
 
+/** Former quality presets, now bitrates: L 320, M 256, S 192 kbps. */
 typedef enum nanompx_profile {
     NANOMPX_PROFILE_NONE = 0, /**< PCM / unused */
-    NANOMPX_PROFILE_L = 1,    /**< Large — highest compressed quality */
-    NANOMPX_PROFILE_M = 2,    /**< Medium — balanced */
-    NANOMPX_PROFILE_S = 3     /**< Small — most aggressive compression */
+    NANOMPX_PROFILE_L = 1,    /**< 320 kbps */
+    NANOMPX_PROFILE_M = 2,    /**< 256 kbps */
+    NANOMPX_PROFILE_S = 3     /**< 192 kbps */
 } nanompx_profile_t;
+
+/** Compressed bitrate (kbps): the whole NanoMPX packets, header included. */
+#define NANOMPX_KBPS_MIN 128
+#define NANOMPX_KBPS_MAX 1024
+#define NANOMPX_KBPS_DEFAULT 320
 
 typedef enum nanompx_err {
     NANOMPX_OK = 0,
@@ -92,6 +98,9 @@ nanompx_encoder_t *nanompx_encoder_create(void);
 void nanompx_encoder_destroy(nanompx_encoder_t *enc);
 
 int nanompx_encoder_set_mode(nanompx_encoder_t *enc, nanompx_mode_t mode);
+/** Compressed bitrate, NANOMPX_KBPS_MIN…NANOMPX_KBPS_MAX (default 320). */
+int nanompx_encoder_set_bitrate(nanompx_encoder_t *enc, unsigned kbps);
+/** Same as set_bitrate with the profile's rate (L 320, M 256, S 192). */
 int nanompx_encoder_set_profile(nanompx_encoder_t *enc, nanompx_profile_t profile);
 int nanompx_encoder_set_clock(nanompx_encoder_t *enc, nanompx_clock_t *clock);
 int nanompx_encoder_set_frame_samples(nanompx_encoder_t *enc, unsigned frame_samples);

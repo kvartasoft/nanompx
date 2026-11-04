@@ -3,7 +3,7 @@
 
 struct nanompx_encoder {
     nanompx_mode_t mode;
-    nanompx_profile_t profile;
+    unsigned kbps;
     nanompx_clock_t *clock;
     unsigned frame_samples;
     uint32_t seq;
@@ -26,11 +26,11 @@ nanompx_encoder_t *nanompx_encoder_create(void)
     if (!enc)
         return NULL;
     enc->mode = NANOMPX_MODE_PCM;
-    enc->profile = NANOMPX_PROFILE_L;
+    enc->kbps = NANOMPX_KBPS_DEFAULT;
     enc->frame_samples = NANOMPX_DEFAULT_FRAME_SAMPLES;
     enc->need_keyframe = 1;
     enc->keyframe_interval = 50; /* ~0.5 s @ 10 ms */
-    enc->comp = nanompx_comp_enc_create(enc->profile);
+    enc->comp = nanompx_comp_enc_create(enc->kbps, NANOMPX_HDR_SIZE);
     if (!enc->comp) {
         free(enc);
         return NULL;
@@ -59,18 +59,24 @@ int nanompx_encoder_set_mode(nanompx_encoder_t *enc, nanompx_mode_t mode)
     return NANOMPX_OK;
 }
 
-int nanompx_encoder_set_profile(nanompx_encoder_t *enc, nanompx_profile_t profile)
+int nanompx_encoder_set_bitrate(nanompx_encoder_t *enc, unsigned kbps)
 {
-    if (!enc)
+    if (!enc || kbps < NANOMPX_KBPS_MIN || kbps > NANOMPX_KBPS_MAX)
         return NANOMPX_ERR_INVALID;
-    if (profile < NANOMPX_PROFILE_L || profile > NANOMPX_PROFILE_S)
-        return NANOMPX_ERR_INVALID;
-    if (enc->profile != profile) {
-        enc->profile = profile;
+    if (enc->kbps != kbps) {
+        enc->kbps = kbps;
         enc->need_keyframe = 1;
-        nanompx_comp_enc_set_profile(enc->comp, profile);
+        nanompx_comp_enc_set_bitrate(enc->comp, kbps, NANOMPX_HDR_SIZE);
     }
     return NANOMPX_OK;
+}
+
+int nanompx_encoder_set_profile(nanompx_encoder_t *enc, nanompx_profile_t profile)
+{
+    static const unsigned kbps[] = { 0, 320, 256, 192 };
+    if (profile < NANOMPX_PROFILE_L || profile > NANOMPX_PROFILE_S)
+        return NANOMPX_ERR_INVALID;
+    return nanompx_encoder_set_bitrate(enc, kbps[profile]);
 }
 
 int nanompx_encoder_set_clock(nanompx_encoder_t *enc, nanompx_clock_t *clock)
@@ -143,7 +149,8 @@ static int emit_frame(nanompx_encoder_t *enc, const int32_t *frame, unsigned n,
     hdr.magic = NANOMPX_MAGIC;
     hdr.version = NANOMPX_PROTOCOL_VERSION;
     hdr.mode = (uint8_t)enc->mode;
-    hdr.profile = (enc->mode == NANOMPX_MODE_COMPRESSED) ? (uint8_t)enc->profile
+    /* compressed: the bitrate in 8 kbps steps (16…128) */
+    hdr.profile = (enc->mode == NANOMPX_MODE_COMPRESSED) ? (uint8_t)(enc->kbps / 8)
                                                          : (uint8_t)NANOMPX_PROFILE_NONE;
     hdr.flags = 0;
     is_kf = enc->need_keyframe;
