@@ -1,13 +1,25 @@
 /* SPDX-License-Identifier: MIT */
 /**
- * FM-aware NanoMPX compressed codec (v4 wire: magic 0xC4).
+ * FM-aware NanoMPX compressed codec (v6 wire: magic 0xC6).
  *
- * - Continuous parametric 19 kHz pilot (protected; 2×/3× carriers)
- * - Band coding: mono (0–15 kHz), stereo L−R (≈23–53 kHz), RDS (≈57 kHz)
- * - Decimated predictive block-float + adaptive Rice entropy on each band
- * - Soft peak limit (no invented overshoots)
+ * The composite is split into the bands an FM MPX carries:
+ *   - pilot   parametric: a PLL in the encoder tracks the 19 kHz pilot; every
+ *             packet carries its phase, frequency and amplitude, and the
+ *             decoder regenerates it (clean, phase-continuous)
+ *   - mono    0–15 kHz, low-passed and decimated to 48 kHz
+ *   - stereo  L−R, demodulated with sin(2θ) of the tracked pilot, 48 kHz
+ *   - RDS     57 kHz ±2.4 kHz as complex (I/Q) baseband at 6 kHz, so any RDS
+ *             carrier phase passes
+ * Band filters are 577-tap Kaiser-windowed sincs (≈68 dB stop band), so the
+ * bands neither alias nor leak into each other.
  *
- * Quality intent is band-weighted (mono/stereo/pilot), not flat MPX SNR.
+ * Each band is transform coded: sine-window MDCT (hop 256 at 48 kHz, 32 at
+ * 6 kHz: 5.3 ms), a quantiser step per group of bins chosen from the block's
+ * own spectrum (noise kept under a flat floor and a set distance below the
+ * local signal: nothing is spent on empty bins, no noise shows above the
+ * programme), and an adaptive range coder whose models follow the stream
+ * (reset on keyframes). Codec delay: 576 (filters) + 2048 (MDCT) samples,
+ * 13.7 ms.
  */
 
 #include "internal.h"
@@ -18,621 +30,902 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#if !defined(log2f)
-static float nanompx_log2f(float x) { return logf(x) / logf(2.f); }
-#define log2f nanompx_log2f
-#endif
-#if !defined(exp2f)
-static float nanompx_exp2f(float x) { return expf(x * logf(2.f)); }
-#define exp2f nanompx_exp2f
-#endif
-
-#define COMP_MAGIC 0xC4
+#define COMP_MAGIC 0xC6
 #define PILOT_HZ 19000.0
-#define BLOCK 32
-#define NS_COEF 0.65f
-#define SCALE_HEADROOM 1.12f
-#define FIR_N 65
-#define CODEC_DELAY (FIR_N - 1) /* analysis + synthesis group delay */
-#define DEC_AUDIO 4             /* 192 kHz → 48 kHz */
-#define DEC_RDS 32              /* 192 kHz → 6 kHz */
-#define RICE_MAX_UNARY 512
+#define W19 (2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE)
 
-/* ~15 kHz LP @ 192 kHz (Hamming sinc), DC gain 1 */
-static const float fir_lp15[FIR_N] = {
-    4.86099489e-19f, 3.96990738e-04f, 7.81865353e-04f, 1.08760938e-03f, 1.20508496e-03f,
-    1.00213809e-03f, 3.75330061e-04f, -6.79962711e-04f, -2.00896590e-03f, -3.27888746e-03f,
-    -4.02663909e-03f, -3.77732726e-03f, -2.21143576e-03f, 6.65855831e-04f, 4.41298689e-03f,
-    8.15292182e-03f, 1.07171196e-02f, 1.09235540e-02f, 7.93556001e-03f, 1.61257727e-03f,
-    -7.25097802e-03f, -1.68889439e-02f, -2.47772121e-02f, -2.80851330e-02f, -2.42856940e-02f,
-    -1.17933474e-02f, 9.52453673e-03f, 3.81012140e-02f, 7.07750248e-02f, 1.03251922e-01f,
-    1.30847368e-01f, 1.49357774e-01f, 1.55874186e-01f, 1.49357774e-01f, 1.30847368e-01f,
-    1.03251922e-01f, 7.07750248e-02f, 3.81012140e-02f, 9.52453673e-03f, -1.17933474e-02f,
-    -2.42856940e-02f, -2.80851330e-02f, -2.47772121e-02f, -1.68889439e-02f, -7.25097802e-03f,
-    1.61257727e-03f, 7.93556001e-03f, 1.09235540e-02f, 1.07171196e-02f, 8.15292182e-03f,
-    4.41298689e-03f, 6.65855831e-04f, -2.21143576e-03f, -3.77732726e-03f, -4.02663909e-03f,
-    -3.27888746e-03f, -2.00896590e-03f, -6.79962711e-04f, 3.75330061e-04f, 1.00213809e-03f,
-    1.20508496e-03f, 1.08760938e-03f, 7.81865353e-04f, 3.96990738e-04f, 4.86099489e-19f,
-};
+#define NF 577                   /* taps of every band filter */
+#define DEC_A 4                  /* mono / stereo: 192 kHz -> 48 kHz */
+#define DEC_R 32                 /* RDS I/Q: 192 kHz -> 6 kHz */
+#define FC_A 15750.0             /* audio cut-off: pass 15.0 kHz, stop 16.5 kHz */
+#define FC_R 2950.0              /* RDS cut-off: pass 2.2 kHz, stop 3.7 kHz */
+#define KAISER_BETA 6.5
 
-/* ~2.5 kHz LP @ 192 kHz for RDS baseband */
-static const float fir_lp25[FIR_N] = {
-    5.26328633e-04f, 6.35514090e-04f, 7.91018877e-04f, 1.00779741e-03f, 1.30038011e-03f,
-    1.68243947e-03f, 2.16636389e-03f, 2.76285104e-03f, 3.48053169e-03f, 4.32563504e-03f,
-    5.30170489e-03f, 6.40937563e-03f, 7.64621485e-03f, 9.00663834e-03f, 1.04819010e-02f,
-    1.20601657e-02f, 1.37266493e-02f, 1.54638447e-02f, 1.72518133e-02f, 1.90685430e-02f,
-    2.08903633e-02f, 2.26924083e-02f, 2.44491164e-02f, 2.61347562e-02f, 2.77239642e-02f,
-    2.91922833e-02f, 3.05166876e-02f, 3.16760809e-02f, 3.26517577e-02f, 3.34278140e-02f,
-    3.39914984e-02f, 3.43334946e-02f, 3.44481284e-02f, 3.43334946e-02f, 3.39914984e-02f,
-    3.34278140e-02f, 3.26517577e-02f, 3.16760809e-02f, 3.05166876e-02f, 2.91922833e-02f,
-    2.77239642e-02f, 2.61347562e-02f, 2.44491164e-02f, 2.26924083e-02f, 2.08903633e-02f,
-    1.90685430e-02f, 1.72518133e-02f, 1.54638447e-02f, 1.37266493e-02f, 1.20601657e-02f,
-    1.04819010e-02f, 9.00663834e-03f, 7.64621485e-03f, 6.40937563e-03f, 5.30170489e-03f,
-    4.32563504e-03f, 3.48053169e-03f, 2.76285104e-03f, 2.16636389e-03f, 1.68243947e-03f,
-    1.30038011e-03f, 1.00779741e-03f, 7.91018877e-04f, 6.35514090e-04f, 5.26328633e-04f,
-};
+#define NBANDS 4                 /* mono, stereo, RDS I, RDS Q */
+#ifndef H_A
+#define H_A 512                  /* MDCT hop, audio bands */
+#endif
+#define H_R (H_A * DEC_A / DEC_R) /* MDCT hop, RDS bands: the same delay */
+#define H_MAX H_A
+#define K_A (H_A * 11 / 16)      /* audio bins coded (to 16.5 kHz) */
+#define K_R (H_R * 7 / 8)        /* RDS bins coded (to 2.6 kHz) */
+#ifndef BW_A
+#define BW_A (H_A / 32)          /* bins per quantiser step (750 Hz) */
+#endif
+#define BW_R (H_R / 8)
+#define NSF_MAX (K_A / BW_A)
+#define D_EXTRA (2 * H_A * DEC_A)        /* MDCT delay at 192 kHz (= 2·H_R·DEC_R) */
+#define CODEC_DELAY (NF - 1 + D_EXTRA)
 
-typedef struct profile_cfg {
-    int bits_mono;
-    int bits_stereo;
-    int bits_rds;
-    int rice_mono;
-    int rice_stereo;
-    int rice_rds;
-} profile_cfg_t;
+#define RING 32768               /* decimated samples per band by index & (RING-1) */
+#define PRING 16                 /* decoder: pilot parameters of recent frames */
 
-static profile_cfg_t profile_cfg(nanompx_profile_t p)
+/* Pilot PLL, per packet: phase and frequency corrections. */
+#define PLL_KP 0.1
+#define PLL_KI 0.005
+#define PILOT_MIN 0.003          /* below: no pilot, the loop holds */
+/* θ in exact integers, so encoder and decoder predict it alike on any CPU:
+ * phase in 2^-24 cycles, frequency in 2^-40 cycles per sample. */
+#define PH_ONE 16777216.0
+#define WQ_ONE 1099511627776.0
+#define AMP_LSB (0.25 / 65536.0)         /* 16-bit amplitude */
+
+#define HDR_BYTES 4              /* magic, profile, count */
+
+#ifdef NANOMPX_STATS
+size_t nanompx_stat_bytes[4];    /* bench: bytes per band */
+#endif
+
+/* --- band filters ----------------------------------------------------------- */
+
+static float h_a[NF], h_r[NF];   /* DC gain 1 */
+
+static double bessel_i0(double x)
 {
-    profile_cfg_t c;
-    switch (p) {
-    case NANOMPX_PROFILE_L:
-        /* Nominal rice_k; encoder may adapt per block */
-        c.bits_mono = 10;
-        c.bits_stereo = 8;
-        c.bits_rds = 5;
-        c.rice_mono = 6;
-        c.rice_stereo = 5;
-        c.rice_rds = 3;
-        break;
-    case NANOMPX_PROFILE_M:
-        c.bits_mono = 7;
-        c.bits_stereo = 5;
-        c.bits_rds = 3;
-        c.rice_mono = 4;
-        c.rice_stereo = 3;
-        c.rice_rds = 2;
-        break;
-    case NANOMPX_PROFILE_S:
-    default:
-        c.bits_mono = 5;
-        c.bits_stereo = 4;
-        c.bits_rds = 2;
-        c.rice_mono = 3;
-        c.rice_stereo = 3;
-        c.rice_rds = 2;
-        break;
+    double s = 1.0, t = 1.0;
+    int k;
+    for (k = 1; k < 40; k++) {
+        t *= (x / (2.0 * k)) * (x / (2.0 * k));
+        s += t;
     }
-    return c;
+    return s;
 }
 
-static int32_t float_to_pcm24(float x)
+static void design_lp(float *h, double fc)
 {
-    if (x > 1.f)
-        x = 1.f;
-    if (x < -1.f)
-        x = -1.f;
-    return (int32_t)lrintf(x * 8388607.f);
+    const int m = (NF - 1) / 2;
+    double sum = 0.0, wc = 2.0 * fc / (double)NANOMPX_SAMPLE_RATE;
+    double i0b = bessel_i0(KAISER_BETA);
+    double tmp[NF];
+    int k;
+    for (k = 0; k < NF; k++) {
+        double t = (double)(k - m);
+        double r = t / (double)m;
+        double sinc = t == 0.0 ? wc : sin(M_PI * wc * t) / (M_PI * t);
+        tmp[k] = sinc * bessel_i0(KAISER_BETA * sqrt(1.0 - r * r)) / i0b;
+        sum += tmp[k];
+    }
+    for (k = 0; k < NF; k++)
+        h[k] = (float)(tmp[k] / sum);
 }
 
-static float pcm24_to_float(int32_t s) { return (float)s / 8388608.f; }
+static int band_dec(int b) { return b < 2 ? DEC_A : DEC_R; }
+static const float *band_h(int b) { return b < 2 ? h_a : h_r; }
+static int band_hop(int b) { return b < 2 ? H_A : H_R; }
+static int band_k(int b) { return b < 2 ? K_A : K_R; }
+static int band_bw(int b) { return b < 2 ? BW_A : BW_R; }
 
-typedef struct bitw {
-    uint8_t *buf;
-    size_t cap;
-    size_t byte_pos;
-    int bit_pos;
-} bitw_t;
-
-static void bitw_init(bitw_t *w, uint8_t *buf, size_t cap)
+/* floor(a / b) for b > 0 */
+static int64_t fdiv(int64_t a, int64_t b)
 {
-    w->buf = buf;
-    w->cap = cap;
-    w->byte_pos = 0;
-    w->bit_pos = 0;
-    if (cap)
-        memset(buf, 0, cap);
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
 }
 
-static int bitw_put(bitw_t *w, uint32_t val, int bits)
+/* Decimated samples of a band are those at 192 kHz indices m·dec. */
+static int64_t mcount(int64_t x, int dec) { return fdiv(x + dec - 1, dec); }
+
+/* MDCT blocks complete once the samples up to x are in: j < J(x). */
+static int64_t blocks_upto(int64_t x, int b)
 {
-    int i;
-    for (i = 0; i < bits; i++) {
-        if (w->byte_pos >= w->cap)
-            return -1;
-        if (val & (1u << i))
-            w->buf[w->byte_pos] |= (uint8_t)(1u << w->bit_pos);
-        w->bit_pos++;
-        if (w->bit_pos == 8) {
-            w->bit_pos = 0;
-            w->byte_pos++;
+    return fdiv(mcount(x, band_dec(b)), band_hop(b)) - 1;
+}
+
+/* --- MDCT (sine window, orthonormal, via a half-size complex FFT) ---------- */
+
+typedef struct mdct_plan {
+    int h, m;                    /* hop, FFT size h/2 */
+    float win[2 * H_MAX];
+    float pre_c[H_MAX / 2], pre_s[H_MAX / 2], post_c[H_MAX / 2], post_s[H_MAX / 2];
+    float tw_c[H_MAX / 4], tw_s[H_MAX / 4];
+    int rev[H_MAX / 2];
+    float scale;
+} mdct_plan_t;
+
+static mdct_plan_t plan_a, plan_r;
+static int tables_ready;
+
+static void plan_init(mdct_plan_t *p, int h)
+{
+    int i, bits = 0;
+    p->h = h;
+    p->m = h / 2;
+    while ((1 << bits) < p->m)
+        bits++;
+    for (i = 0; i < 2 * h; i++)
+        p->win[i] = (float)sin(M_PI * (i + 0.5) / (2.0 * h));
+    for (i = 0; i < p->m; i++) {
+        int r = 0, b;
+        for (b = 0; b < bits; b++)
+            if (i & (1 << b))
+                r |= 1 << (bits - 1 - b);
+        p->rev[i] = r;
+        p->pre_c[i] = (float)cos(-M_PI * (4 * i + 1) / (4.0 * h));
+        p->pre_s[i] = (float)sin(-M_PI * (4 * i + 1) / (4.0 * h));
+        p->post_c[i] = (float)cos(-M_PI * i / (double)h);
+        p->post_s[i] = (float)sin(-M_PI * i / (double)h);
+    }
+    for (i = 0; i < p->m / 2; i++) {
+        p->tw_c[i] = (float)cos(-2.0 * M_PI * i / p->m);
+        p->tw_s[i] = (float)sin(-2.0 * M_PI * i / p->m);
+    }
+    p->scale = (float)sqrt(2.0 / h);
+}
+
+static void tables_init(void)
+{
+    if (tables_ready)
+        return;
+    design_lp(h_a, FC_A);
+    design_lp(h_r, FC_R);
+    plan_init(&plan_a, H_A);
+    plan_init(&plan_r, H_R);
+    tables_ready = 1;
+}
+
+static void fft(const mdct_plan_t *p, float *re, float *im)
+{
+    int i, len, m = p->m;
+    for (i = 0; i < m; i++) {
+        int r = p->rev[i];
+        if (i < r) {
+            float t = re[i]; re[i] = re[r]; re[r] = t;
+            t = im[i]; im[i] = im[r]; im[r] = t;
         }
     }
+    for (len = 2; len <= m; len <<= 1) {
+        int half = len >> 1, step = m / len, j;
+        for (i = 0; i < m; i += len)
+            for (j = 0; j < half; j++) {
+                float wr = p->tw_c[j * step], wi = p->tw_s[j * step];
+                float xr = re[i + j + half], xi = im[i + j + half];
+                float tr = xr * wr - xi * wi, ti = xr * wi + xi * wr;
+                re[i + j + half] = re[i + j] - tr;
+                im[i + j + half] = im[i + j] - ti;
+                re[i + j] += tr;
+                im[i + j] += ti;
+            }
+    }
+}
+
+/* out[k] = Σ v[n]·cos(π/h·(n+½)(k+½)), k, n < h */
+static void dct4(const mdct_plan_t *p, const float *v, float *out)
+{
+    float re[H_MAX / 2], im[H_MAX / 2];
+    int i, h = p->h, m = p->m;
+    for (i = 0; i < m; i++) {
+        float a = v[2 * i], b = v[h - 1 - 2 * i];
+        re[i] = a * p->pre_c[i] - b * p->pre_s[i];
+        im[i] = a * p->pre_s[i] + b * p->pre_c[i];
+    }
+    fft(p, re, im);
+    for (i = 0; i < m; i++) {
+        float dr = re[i] * p->post_c[i] - im[i] * p->post_s[i];
+        float di = re[i] * p->post_s[i] + im[i] * p->post_c[i];
+        out[2 * i] = dr;
+        out[h - 1 - 2 * i] = -di;
+    }
+}
+
+/* X[k] from 2h windowed samples x */
+static void mdct_fwd(const mdct_plan_t *p, const float *x, float *X)
+{
+    float v[H_MAX];
+    int i, h = p->h, q = h / 2;
+    for (i = 0; i < q; i++)
+        v[i] = -x[3 * q - 1 - i] * p->win[3 * q - 1 - i] - x[3 * q + i] * p->win[3 * q + i];
+    for (i = q; i < h; i++)
+        v[i] = x[i - q] * p->win[i - q] - x[3 * q - 1 - i] * p->win[3 * q - 1 - i];
+    dct4(p, v, X);
+    for (i = 0; i < h; i++)
+        X[i] *= p->scale;
+}
+
+/* 2h windowed output samples y for overlap-add */
+static void mdct_inv(const mdct_plan_t *p, const float *X, float *y)
+{
+    float u[H_MAX];
+    int i, h = p->h, q = h / 2;
+    dct4(p, X, u);
+    for (i = 0; i < q; i++) {
+        y[3 * q - 1 - i] = -u[i];
+        y[3 * q + i] = -u[i];
+    }
+    for (i = q; i < h; i++) {
+        y[i - q] = u[i];
+        y[3 * q - 1 - i] = -u[i];
+    }
+    for (i = 0; i < 2 * h; i++)
+        y[i] *= p->scale * p->win[i];
+}
+
+static const mdct_plan_t *band_plan(int b) { return b < 2 ? &plan_a : &plan_r; }
+
+/* --- range coder (LZMA style) ---------------------------------------------- */
+
+typedef struct rc_enc {
+    uint64_t low;
+    uint32_t range;
+    uint8_t cache;
+    uint64_t cache_size;
+    uint8_t *buf;
+    size_t pos, cap;
+    int err;
+} rc_enc_t;
+
+static void rce_init(rc_enc_t *r, uint8_t *buf, size_t cap)
+{
+    memset(r, 0, sizeof(*r));
+    r->range = 0xffffffffu;
+    r->cache_size = 1;
+    r->buf = buf;
+    r->cap = cap;
+}
+
+static void rce_byte(rc_enc_t *r, uint8_t b)
+{
+    if (r->pos < r->cap)
+        r->buf[r->pos++] = b;
+    else
+        r->err = 1;
+}
+
+static void rce_shift(rc_enc_t *r)
+{
+    if ((uint32_t)r->low < 0xff000000u || (r->low >> 32) != 0) {
+        uint8_t carry = (uint8_t)(r->low >> 32), t = r->cache;
+        do {
+            rce_byte(r, (uint8_t)(t + carry));
+            t = 0xff;
+        } while (--r->cache_size);
+        r->cache = (uint8_t)(r->low >> 24);
+    }
+    r->cache_size++;
+    r->low = (r->low & 0x00ffffffu) << 8;
+}
+
+static void rce_code(rc_enc_t *r, uint32_t cum, uint32_t freq, uint32_t tot)
+{
+    uint32_t q = r->range / tot;
+    r->low += (uint64_t)q * cum;
+    r->range = q * freq;
+    while (r->range < (1u << 24)) {
+        r->range <<= 8;
+        rce_shift(r);
+    }
+}
+
+static void rce_bits(rc_enc_t *r, uint32_t v, int n)
+{
+    while (n > 0) {
+        int k = n > 16 ? 16 : n;
+        n -= k;
+        rce_code(r, (v >> n) & ((1u << k) - 1u), 1, 1u << k);
+    }
+}
+
+static void rce_finish(rc_enc_t *r)
+{
+    /* Any value in [low, low+range) decodes the same: take the one with the
+     * most trailing zero bits, flush, and drop the trailing zero bytes (the
+     * decoder reads zeros past the end). */
+    int k;
+    for (k = 1; k <= 4; k++) {
+        uint64_t mask = (1ull << (32 - 8 * k)) - 1ull;
+        uint64_t v = (r->low + mask) & ~mask;
+        if (v - r->low < (uint64_t)r->range) {
+            r->low = v;
+            break;
+        }
+    }
+    for (k = 0; k < 5; k++)
+        rce_shift(r);
+    while (r->pos > 0 && r->buf[r->pos - 1] == 0)
+        r->pos--;
+}
+
+typedef struct rc_dec {
+    uint32_t range, code, q;
+    const uint8_t *buf;
+    size_t pos, len;
+    int err;
+} rc_dec_t;
+
+static uint8_t rcd_byte(rc_dec_t *r)
+{
+    if (r->pos < r->len)
+        return r->buf[r->pos++];
+    /* past the end: zeros (the encoder trims them), within reason */
+    r->pos++;
+    if (r->pos > r->len + 4096)
+        r->err = 1;
     return 0;
 }
 
-static size_t bitw_bytes(const bitw_t *w)
+static void rcd_init(rc_dec_t *r, const uint8_t *buf, size_t len)
 {
-    return w->byte_pos + (w->bit_pos ? 1 : 0);
-}
-
-typedef struct bitr {
-    const uint8_t *buf;
-    size_t len;
-    size_t byte_pos;
-    int bit_pos;
-} bitr_t;
-
-static void bitr_init(bitr_t *r, const uint8_t *buf, size_t len)
-{
+    int i;
+    memset(r, 0, sizeof(*r));
     r->buf = buf;
     r->len = len;
-    r->byte_pos = 0;
-    r->bit_pos = 0;
+    r->range = 0xffffffffu;
+    for (i = 0; i < 5; i++)
+        r->code = (r->code << 8) | rcd_byte(r);
 }
 
-static int bitr_get_bits(bitr_t *r, int bits, uint32_t *out)
+static uint32_t rcd_peek(rc_dec_t *r, uint32_t tot)
 {
-    uint32_t val = 0;
+    uint32_t v;
+    r->q = r->range / tot;
+    v = r->code / r->q;
+    return v < tot ? v : tot - 1;
+}
+
+static void rcd_take(rc_dec_t *r, uint32_t cum, uint32_t freq)
+{
+    r->code -= r->q * cum;
+    r->range = r->q * freq;
+    while (r->range < (1u << 24)) {
+        r->code = (r->code << 8) | rcd_byte(r);
+        r->range <<= 8;
+    }
+}
+
+static uint32_t rcd_bits(rc_dec_t *r, int n)
+{
+    uint32_t v = 0;
+    while (n > 0) {
+        int k = n > 16 ? 16 : n;
+        uint32_t s = rcd_peek(r, 1u << k);
+        rcd_take(r, s, 1);
+        v = (v << k) | s;
+        n -= k;
+    }
+    return v;
+}
+
+/* --- adaptive models -------------------------------------------------------- */
+
+#define MSYM_MAX 26
+#ifndef M_INC
+#define M_INC 24
+#endif
+#ifndef M_LIMIT
+#define M_LIMIT (1 << 13)
+#endif
+
+typedef struct model {
+    uint16_t f[MSYM_MAX];
+    uint16_t tot;
+    uint8_t n;
+} model_t;
+
+static void model_init(model_t *m, int n)
+{
     int i;
-    for (i = 0; i < bits; i++) {
-        if (r->byte_pos >= r->len)
-            return -1;
-        if (r->buf[r->byte_pos] & (1u << r->bit_pos))
-            val |= (1u << i);
-        r->bit_pos++;
-        if (r->bit_pos == 8) {
-            r->bit_pos = 0;
-            r->byte_pos++;
-        }
-    }
-    *out = val;
-    return 0;
-}
-
-static int bitw_put_f32(bitw_t *w, float f)
-{
-    union {
-        float f;
-        uint32_t u;
-    } u;
-    u.f = f;
-    return bitw_put(w, u.u & 0xff, 8) || bitw_put(w, (u.u >> 8) & 0xff, 8) ||
-           bitw_put(w, (u.u >> 16) & 0xff, 8) || bitw_put(w, (u.u >> 24) & 0xff, 8);
-}
-
-static int bitr_get_f32(bitr_t *r, float *out)
-{
-    uint32_t raw = 0, b;
-    union {
-        float f;
-        uint32_t u;
-    } u;
-    if (bitr_get_bits(r, 8, &b))
-        return -1;
-    raw = b & 0xff;
-    if (bitr_get_bits(r, 8, &b))
-        return -1;
-    raw |= (b & 0xff) << 8;
-    if (bitr_get_bits(r, 8, &b))
-        return -1;
-    raw |= (b & 0xff) << 16;
-    if (bitr_get_bits(r, 8, &b))
-        return -1;
-    raw |= (b & 0xff) << 24;
-    u.u = raw;
-    *out = u.f;
-    return 0;
-}
-
-static uint8_t scale_to_u8(float scale)
-{
-    float c;
-    if (scale < 1e-8f)
-        scale = 1e-8f;
-    c = 140.f + 16.f * log2f(scale);
-    if (c < 0.f)
-        c = 0.f;
-    if (c > 255.f)
-        c = 255.f;
-    return (uint8_t)lrintf(c);
-}
-
-static float u8_to_scale(uint8_t code)
-{
-    return exp2f(((float)code - 140.f) / 16.f);
-}
-
-static uint32_t zig_encode(int32_t v)
-{
-    if (v < 0)
-        return (uint32_t)((((uint32_t)(-v)) << 1) - 1u);
-    return (uint32_t)v << 1;
-}
-
-static int32_t zig_decode(uint32_t u)
-{
-    if (u & 1u)
-        return -(int32_t)(u >> 1) - 1;
-    return (int32_t)(u >> 1);
-}
-
-static int rice_put(bitw_t *w, int32_t v, int k)
-{
-    uint32_t u = zig_encode(v);
-    uint32_t q = (k > 0) ? (u >> k) : u;
-    uint32_t r = (k > 0) ? (u & ((1u << k) - 1u)) : 0;
-    uint32_t i;
-    if (q > RICE_MAX_UNARY)
-        return -1;
-    for (i = 0; i < q; i++) {
-        if (bitw_put(w, 1, 1))
-            return -1;
-    }
-    if (bitw_put(w, 0, 1))
-        return -1;
-    if (k > 0 && bitw_put(w, r, k))
-        return -1;
-    return 0;
-}
-
-static int rice_get(bitr_t *r, int k, int32_t *out)
-{
-    uint32_t q = 0;
-    uint32_t rem = 0;
-    uint32_t bit;
-    while (1) {
-        if (bitr_get_bits(r, 1, &bit))
-            return -1;
-        if (bit == 0)
-            break;
-        q++;
-        if (q > RICE_MAX_UNARY)
-            return -1;
-    }
-    if (k > 0 && bitr_get_bits(r, k, &rem))
-        return -1;
-    *out = zig_decode((k > 0) ? ((q << k) | rem) : q);
-    return 0;
-}
-
-typedef struct fir_state {
-    float hist[FIR_N - 1];
-} fir_state_t;
-
-static void fir_reset(fir_state_t *s) { memset(s, 0, sizeof(*s)); }
-
-static float fir_step(fir_state_t *s, const float *h, float x)
-{
-    float acc = h[0] * x;
-    int i;
-    for (i = 0; i < FIR_N - 1; i++)
-        acc += h[i + 1] * s->hist[i];
-    for (i = FIR_N - 2; i > 0; i--)
-        s->hist[i] = s->hist[i - 1];
-    if (FIR_N > 1)
-        s->hist[0] = x;
-    return acc;
-}
-
-/* Continuous-phase decimate: emit when phase==0, advance phase across frames. */
-static int choose_rice_k(const int32_t *q, size_t n, int tip)
-{
-    size_t i;
-    double mean = 0.0;
-    int k;
-    if (n == 0)
-        return tip;
+    m->n = (uint8_t)n;
     for (i = 0; i < n; i++)
-        mean += (double)zig_encode(q[i]);
-    mean /= (double)n;
-    k = 0;
-    while (k < 14 && (double)(1u << (k + 1)) < mean)
-        k++;
-    /* Prefer tip when close — keeps streams stable */
-    if (tip > k && tip - k <= 2)
-        k = tip;
-    if (k > 14)
-        k = 14;
-    return k;
+        m->f[i] = 1;
+    m->tot = (uint16_t)n;
 }
 
-static int quantize_pred_rice(const float *in, size_t n, int bits, int rice_tip, bitw_t *w,
-                              float *pred_state)
+static void model_update(model_t *m, int s)
 {
-    size_t off = 0;
-    float prev = *pred_state;
-    float err = 0.f;
-    int32_t qmax = (1 << (bits - 1)) - 1;
-    int32_t qbuf[BLOCK];
-    if (qmax < 1)
-        qmax = 1;
-
-    while (off < n) {
-        size_t len = n - off;
-        size_t i;
-        float peak = 1e-12f;
-        float scale;
-        float p = prev;
-        float prev_blk = prev;
-        float err_blk = err;
-        int k;
-        if (len > BLOCK)
-            len = BLOCK;
-
-        for (i = 0; i < len; i++) {
-            float a = fabsf(in[off + i] - p);
-            if (a > peak)
-                peak = a;
-            p = in[off + i];
+    m->f[s] += M_INC;
+    m->tot += M_INC;
+    if (m->tot > M_LIMIT) {
+        int i;
+        m->tot = 0;
+        for (i = 0; i < m->n; i++) {
+            m->f[i] = (uint16_t)((m->f[i] + 1) >> 1);
+            m->tot += m->f[i];
         }
-        peak *= SCALE_HEADROOM;
-        scale = u8_to_scale(scale_to_u8(peak));
+    }
+}
 
-        for (i = 0; i < len; i++) {
-            float target = in[off + i] - prev_blk - NS_COEF * err_blk;
-            int32_t q = (int32_t)lrintf((target / scale) * (float)qmax);
-            float recon;
-            if (q > qmax)
-                q = qmax;
-            if (q < -qmax - 1)
-                q = -qmax - 1;
-            qbuf[i] = q;
-            recon = ((float)q / (float)qmax) * scale;
-            err_blk = recon - (in[off + i] - prev_blk);
-            prev_blk += recon;
+static void model_put(rc_enc_t *r, model_t *m, int s)
+{
+    uint32_t cum = 0;
+    int i;
+    for (i = 0; i < s; i++)
+        cum += m->f[i];
+    rce_code(r, cum, m->f[s], m->tot);
+    model_update(m, s);
+}
+
+static int model_get(rc_dec_t *r, model_t *m)
+{
+    uint32_t v = rcd_peek(r, m->tot), cum = 0;
+    int s = 0;
+    while (s < m->n - 1 && cum + m->f[s] <= v)
+        cum += m->f[s++];
+    rcd_take(r, cum, m->f[s]);
+    model_update(m, s);
+    return s;
+}
+
+/* Coefficient magnitudes 0..MAG_ESC-1, MAG_ESC = escape; step deltas. */
+#define MAG_ESC 17
+#define NCTX 108                 /* two previous bins (3·3) × same bin last block (4) × 3 positions */
+#define SD_RANGE 12              /* step delta −12..12, then escape */
+#define SD_ESC (2 * SD_RANGE + 1)
+
+typedef struct band_models {
+    model_t mag[NCTX];
+    float last[K_A];             /* |X| of each bin in the previous block */
+    model_t sd[2];               /* first step of a block, the rest */
+    int prev_first;              /* step index of the previous block's first group */
+} band_models_t;
+
+static void models_init(band_models_t *bm)
+{
+    int i;
+    for (i = 0; i < NCTX; i++)
+        model_init(&bm->mag[i], MAG_ESC + 1);
+    model_init(&bm->sd[0], SD_ESC + 1);
+    model_init(&bm->sd[1], SD_ESC + 1);
+    memset(bm->last, 0, sizeof(bm->last));
+    bm->prev_first = 40;
+}
+
+/* step = 2^(−idx/4); idx 0..127 */
+static float step_of(int idx) { return exp2f(-(float)idx * 0.25f); }
+
+/* Context: the two bins below, and this bin's level in the previous block
+ * against the current step (tones last from block to block). */
+static int mag_ctx(const band_models_t *bm, const int32_t *q, int k, int K, float inv_step)
+{
+    int a = k > 0 ? abs(q[k - 1]) : 0, b = k > 1 ? abs(q[k - 2]) : 0, t;
+    float l = bm->last[k] * inv_step;
+    if (a > 2)
+        a = 2;
+    if (b > 2)
+        b = 2;
+    t = l < 0.5f ? 0 : l < 1.5f ? 1 : l < 4.f ? 2 : 3;
+    return ((a * 3 + b) * 4 + t) * 3 + (k * 3) / K;
+}
+
+static void remember(band_models_t *bm, const int32_t *q, const int *idx, int bw, int K)
+{
+    int k;
+    for (k = 0; k < K; k++)
+        bm->last[k] = fabsf((float)q[k]) * step_of(idx[k / bw]);
+}
+
+
+/* --- block coding ----------------------------------------------------------- */
+
+/* Per band (mono, stereo, RDS): noise power per coefficient never above
+ * floor, nor rel below the block's mean power, nor smr below the local
+ * signal averaged over ±(sp + spk·bin) bins; a group of bins shares the step
+ * that meets the targets of all but its weakest pct of bins (those may fall
+ * to zero). Audio is coded for the least squared error: one noise level per
+ * block, rel below its power (quiet passages as clean as loud ones), which
+ * the rate control then moves; a setting of −100 dB is off. */
+typedef struct quality {
+    float floor_db[3], rel_db[3], smr_db[3], spk[3], pct[3];
+} quality_t;
+
+#ifdef NANOMPX_STATS
+#include <stdio.h>
+/* bench: tuning overrides from the environment */
+static float tune(const char *name, int b, float def)
+{
+    char key[32];
+    const char *v;
+    snprintf(key, sizeof(key), "%s%d", name, b);
+    v = getenv(key);
+    return v ? (float)atof(v) : def;
+}
+#else
+#define tune(name, b, def) (def)
+#endif
+
+/* Bitrate per profile (kbps): the encoder spends it, easing the noise targets
+ * when content is dense and tightening them (up to RATE_TIGHT_MAX dB) when it
+ * is light. A leaky bucket: 1 dB per RATE_DB_BITS of debt or credit. */
+#ifndef RATE_DB_BITS
+#define RATE_DB_BITS 3000.0
+#endif
+#define RATE_EASE_MAX 24.0
+#define RATE_TIGHT_MAX 6.0
+
+static double profile_kbps(nanompx_profile_t p)
+{
+    double k = p == NANOMPX_PROFILE_L ? 316.0 : p == NANOMPX_PROFILE_M ? 256.0 : 192.0;
+    return tune("NMPX_KBPS", 0, (float)k);
+}
+
+static quality_t profile_quality(nanompx_profile_t p)
+{
+    /*                          floor          rel                smr                spread     pct */
+    static const quality_t L = { { 0, 0, -50 }, { 66, 62, -100 }, { -100, -100, 12 }, { 0, 0, 0 }, { 0, 0, 0 } };
+    static const quality_t M = { { 0, 0, -49 }, { 60, 56, -100 }, { -100, -100, 10 }, { 0, 0, 0 }, { 0, 0, 0 } };
+    static const quality_t S = { { 0, 0, -48 }, { 54, 50, -100 }, { -100, -100, 8 }, { 0, 0, 0 }, { 0, 0, 0 } };
+    quality_t q = p == NANOMPX_PROFILE_L ? L : p == NANOMPX_PROFILE_M ? M : S;
+    int b;
+    for (b = 0; b < 3; b++) {
+        q.floor_db[b] = tune("NMPX_FLOOR", b, q.floor_db[b]);
+        q.rel_db[b] = tune("NMPX_REL", b, q.rel_db[b]);
+        q.smr_db[b] = tune("NMPX_SMR", b, q.smr_db[b]);
+        q.spk[b] = tune("NMPX_SPK", b, q.spk[b]);
+        q.pct[b] = tune("NMPX_PCT", b, q.pct[b]);
+    }
+    return q;
+}
+
+static void put_mag(rc_enc_t *r, band_models_t *bm, int ctx, uint32_t a)
+{
+    if (a < MAG_ESC) {
+        model_put(r, &bm->mag[ctx], (int)a);
+        return;
+    }
+    model_put(r, &bm->mag[ctx], MAG_ESC);
+    a -= MAG_ESC;               /* Elias-gamma of a+1 */
+    {
+        uint32_t v = a + 1;
+        int nb = 0;
+        while ((v >> nb) > 1)
+            nb++;
+        rce_bits(r, (uint32_t)nb, 5);
+        rce_bits(r, v & ((1u << nb) - 1u), nb);
+    }
+}
+
+static uint32_t get_mag(rc_dec_t *r, band_models_t *bm, int ctx)
+{
+    int s = model_get(r, &bm->mag[ctx]);
+    uint32_t nb, v;
+    if (s < MAG_ESC)
+        return (uint32_t)s;
+    nb = rcd_bits(r, 5);
+    v = (1u << nb) | rcd_bits(r, (int)nb);
+    return v - 1 + MAG_ESC;
+}
+
+static void put_sd(rc_enc_t *r, model_t *m, int d, int idx)
+{
+    if (d >= -SD_RANGE && d <= SD_RANGE) {
+        model_put(r, m, d + SD_RANGE);
+        return;
+    }
+    model_put(r, m, SD_ESC);
+    rce_bits(r, (uint32_t)idx, 7);
+}
+
+static int get_sd(rc_dec_t *r, model_t *m, int prev)
+{
+    int s = model_get(r, m);
+    if (s < SD_ESC)
+        return prev + s - SD_RANGE;
+    return (int)rcd_bits(r, 7);
+}
+
+/* Code one MDCT block of band b from X[0..K). */
+static void enc_block(rc_enc_t *r, band_models_t *bm, int b, const float *X, quality_t ql)
+{
+    int K = band_k(b), bw = band_bw(b), nsf = K / bw, i, s, t = b < 2 ? b : 2;
+    float smr = powf(10.f, -ql.smr_db[t] / 10.f);
+    float fl = powf(10.f, ql.floor_db[t] / 10.f);
+    float E[K_A], Es[K_A];
+    int idx[NSF_MAX], prev;
+    int32_t q[K_A];
+    int sp0 = b < 2 ? 2 : 1;
+    float spk = ql.spk[t];                  /* extra spread per bin */
+    float dz = tune("NMPX_DZ", 0, 0.44f);   /* rounding offset: a slight dead zone */
+    float pct = ql.pct[t];                  /* which of the group's targets sets the step */
+
+    {
+        float mean = 0.f;
+        for (i = 0; i < K; i++) {
+            E[i] = X[i] * X[i];
+            mean += E[i];
         }
-        k = choose_rice_k(qbuf, len, rice_tip);
-        if (bitw_put(w, (uint32_t)k, 4) || bitw_put(w, scale_to_u8(peak), 8))
+        mean /= (float)K;
+        if (mean * powf(10.f, -ql.rel_db[t] / 10.f) < fl)
+            fl = mean * powf(10.f, -ql.rel_db[t] / 10.f);
+        if (fl < 1e-16f)
+            fl = 1e-16f;
+    }
+    for (i = 0; i < K; i++) {
+        int sp = sp0 + (int)(spk * (float)i);
+        int a = i - sp < 0 ? 0 : i - sp, z = i + sp >= K ? K - 1 : i + sp, j;
+        float acc = 0.f;
+        for (j = a; j <= z; j++)
+            acc += E[j];
+        Es[i] = acc / (float)(z - a + 1);
+    }
+    for (s = 0; s < nsf; s++) {
+        float dl[BW_A], d, st;
+        int n = 0, j;
+        for (i = s * bw; i < (s + 1) * bw; i++) {
+            float di = Es[i] * smr;
+            if (di > fl)
+                di = fl;
+            if (di < fl * 1e-3f)
+                di = fl * 1e-3f;   /* empty bins: a sane step, they code as 0 */
+            /* insertion sort: the group's targets, lowest first */
+            for (j = n; j > 0 && dl[j - 1] > di; j--)
+                dl[j] = dl[j - 1];
+            dl[j] = di;
+            n++;
+        }
+        /* The step meets the target of all but the weakest bins of the group. */
+        d = dl[(int)(pct * (float)(n - 1))];
+        st = sqrtf(12.f * d);
+        idx[s] = (int)lrintf(-4.f * log2f(st));
+        if (idx[s] < 0)
+            idx[s] = 0;
+        if (idx[s] > 127)
+            idx[s] = 127;
+    }
+    prev = bm->prev_first;
+    for (s = 0; s < nsf; s++) {
+        put_sd(r, &bm->sd[s ? 1 : 0], idx[s] - prev, idx[s]);
+        prev = idx[s];
+    }
+    bm->prev_first = idx[0];
+    for (s = 0; s < nsf; s++) {
+        float inv = 1.f / step_of(idx[s]);
+        for (i = s * bw; i < (s + 1) * bw; i++) {
+            float a = fabsf(X[i]) * inv;
+            int32_t v = (int32_t)(a + dz);
+            q[i] = X[i] < 0.f ? -v : v;
+        }
+    }
+    for (i = 0; i < K; i++) {
+        uint32_t a = (uint32_t)abs(q[i]);
+        put_mag(r, bm, mag_ctx(bm, q, i, K, 1.f / step_of(idx[i / bw])), a);
+        if (a)
+            rce_bits(r, q[i] < 0, 1);
+    }
+    remember(bm, q, idx, bw, K);
+}
+
+static int dec_block(rc_dec_t *r, band_models_t *bm, int b, float *X)
+{
+    int K = band_k(b), H = band_hop(b), bw = band_bw(b), nsf = K / bw, i, s, prev;
+    int idx[NSF_MAX];
+    int32_t q[K_A];
+
+    prev = bm->prev_first;
+    for (s = 0; s < nsf; s++) {
+        idx[s] = get_sd(r, &bm->sd[s ? 1 : 0], prev);
+        if (idx[s] < 0 || idx[s] > 127)
             return -1;
-        for (i = 0; i < len; i++) {
-            if (rice_put(w, qbuf[i], k))
-                return -1;
-        }
-        prev = prev_blk;
-        err = err_blk;
-        off += len;
+        prev = idx[s];
     }
-    *pred_state = prev;
-    return 0;
-}
-
-static int dequantize_pred_rice(float *out, size_t n, int bits, int rice_tip, bitr_t *r,
-                                float *pred_state)
-{
-    size_t off = 0;
-    float prev = *pred_state;
-    int32_t qmax = (1 << (bits - 1)) - 1;
-    (void)rice_tip;
-    if (qmax < 1)
-        qmax = 1;
-
-    while (off < n) {
-        size_t len = n - off;
-        size_t i;
-        float scale;
-        uint32_t sc, kbits;
-        int k;
-        if (len > BLOCK)
-            len = BLOCK;
-        if (bitr_get_bits(r, 4, &kbits) || bitr_get_bits(r, 8, &sc))
+    bm->prev_first = idx[0];
+    for (i = 0; i < K; i++) {
+        uint32_t a = get_mag(r, bm, mag_ctx(bm, q, i, K, 1.f / step_of(idx[i / bw])));
+        if (a > (1u << 24))
             return -1;
-        k = (int)kbits;
-        scale = u8_to_scale((uint8_t)sc);
-        for (i = 0; i < len; i++) {
-            int32_t q;
-            float recon;
-            if (rice_get(r, k, &q))
-                return -1;
-            recon = ((float)q / (float)qmax) * scale;
-            prev += recon;
-            out[off + i] = prev;
+        q[i] = (int32_t)a;
+        if (a && rcd_bits(r, 1))
+            q[i] = -q[i];
+    }
+    remember(bm, q, idx, bw, K);
+    for (s = 0; s < nsf; s++) {
+        float st = step_of(idx[s]);
+        for (i = s * bw; i < (s + 1) * bw; i++)
+            X[i] = (float)q[i] * st;
+    }
+    for (i = K; i < H; i++)
+        X[i] = 0.f;
+    return r->err ? -1 : 0;
+}
+
+/* --- carriers ------------------------------------------------------------- */
+
+/* sin θ, sin 2θ, cos 3θ, sin 3θ for θ = phi + w·j, j = 0..n-1 (s1 may be NULL). */
+static void carriers(double phi, double w, size_t n, float *s1, float *s2, float *c3, float *s3)
+{
+    double s = sin(phi), c = cos(phi), ds = sin(w), dc = cos(w);
+    size_t j;
+    for (j = 0; j < n; j++) {
+        double t;
+        if (s1)
+            s1[j] = (float)s;
+        s2[j] = (float)(2.0 * s * c);
+        c3[j] = (float)(c * (4.0 * c * c - 3.0));
+        s3[j] = (float)(s * (3.0 - 4.0 * s * s));
+        t = s * dc + c * ds;
+        c = c * dc - s * ds;
+        s = t;
+        if ((j & 255) == 255) {      /* keep the rotator on the unit circle */
+            double g = 1.5 - 0.5 * (s * s + c * c);
+            s *= g;
+            c *= g;
         }
-        off += len;
     }
-    *pred_state = prev;
-    return 0;
 }
 
-static void refine_pilot_amp(const float *x, size_t n, uint64_t sample_base, float phase0,
-                             float *amp)
+static double wrap_2pi(double p)
 {
-    double sI = 0.0, sQ = 0.0;
-    size_t i;
-    double w = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
-    for (i = 0; i < n; i++) {
-        double ph = w * (double)(sample_base + i) + (double)phase0;
-        sI += (double)x[i] * cos(ph);
-        sQ += (double)x[i] * sin(ph);
-    }
-    sI *= 2.0 / (double)n;
-    sQ *= 2.0 / (double)n;
-    (void)sI;
-    /* Project onto locked sin(ωt+φ) model: amp ≈ 〈x, sin〉 */
-    *amp = (float)sQ;
-    if (*amp < 0.f)
-        *amp = 0.f;
+    p = fmod(p, 2.0 * M_PI);
+    return p < 0.0 ? p + 2.0 * M_PI : p;
 }
 
-static void fit_pilot(const float *x, size_t n, uint64_t sample_base, float *amp, float *phase0)
+/* Pilot parameters as sent. */
+static int64_t wq_nominal(void) { return llround(PILOT_HZ / (double)NANOMPX_SAMPLE_RATE * WQ_ONE); }
+static double ph_rad(uint32_t ph) { return (double)ph / PH_ONE * 2.0 * M_PI; }
+static double wq_rad(int64_t wq) { return (double)wq / WQ_ONE * 2.0 * M_PI; }
+static uint32_t ph_of(double rad) { return (uint32_t)llround(wrap_2pi(rad) / (2.0 * M_PI) * PH_ONE) & 0xffffffu; }
+
+/* θ at the start of the frame after one of len samples. */
+static uint32_t ph_next(uint32_t ph, int64_t wq, size_t len)
 {
-    double sI = 0.0, sQ = 0.0;
-    size_t i;
-    double w = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
-    for (i = 0; i < n; i++) {
-        double t = (double)(sample_base + i);
-        sI += (double)x[i] * cos(w * t);
-        sQ += (double)x[i] * sin(w * t);
-    }
-    sI *= 2.0 / (double)n;
-    sQ *= 2.0 / (double)n;
-    *amp = (float)sqrt(sI * sI + sQ * sQ);
-    *phase0 = (float)(atan2(sI, sQ) - w * (double)sample_base);
+    return (uint32_t)(ph + (uint32_t)((wq * (int64_t)len + 32768) >> 16)) & 0xffffffu;
 }
 
-/* Continuous-phase decimate: emit when phase==0, advance phase across frames. */
-static void fir_decimate(fir_state_t *fir, const float *h, const float *in, size_t n, int dec,
-                         int *phase, float *out, size_t *out_n)
+static uint32_t amp_q(double a)
 {
-    size_t i, o = 0;
-    int ph = *phase;
-    for (i = 0; i < n; i++) {
-        float y = fir_step(fir, h, in[i]);
-        if (ph == 0)
-            out[o++] = y;
-        ph++;
-        if (ph == dec)
-            ph = 0;
-    }
-    *phase = ph;
-    *out_n = o;
+    long v = lrint(a / AMP_LSB);
+    return (uint32_t)(v < 0 ? 0 : v > 65535 ? 65535 : v);
 }
 
-/* Continuous-phase upsample + synthesis FIR (gain = dec on nonzero taps). */
-static void upsample_fir(fir_state_t *fir, const float *h, const float *in, size_t n_in, int dec,
-                         int *phase, float *out, size_t n_out)
+/* Signed exp-Golomb in bypass bits. */
+static void put_eg(rc_enc_t *r, int64_t v)
 {
-    size_t i, s = 0;
-    int ph = *phase;
-    for (i = 0; i < n_out; i++) {
-        float inj = 0.f;
-        if (ph == 0 && s < n_in) {
-            inj = in[s++] * (float)dec;
-        }
-        out[i] = fir_step(fir, h, inj);
-        ph++;
-        if (ph == dec)
-            ph = 0;
-    }
-    *phase = ph;
+    uint64_t u = v < 0 ? ((uint64_t)(-(v + 1)) << 1) | 1u : (uint64_t)v << 1;
+    int nb = 0;
+    u++;
+    while ((u >> nb) > 1)
+        nb++;
+    rce_bits(r, (uint32_t)nb, 6);
+    if (nb > 32)
+        rce_bits(r, (uint32_t)(u >> 32), nb - 32);
+    rce_bits(r, (uint32_t)u, nb > 32 ? 32 : nb);
 }
+
+static int64_t get_eg(rc_dec_t *r)
+{
+    int nb = (int)rcd_bits(r, 6);
+    uint64_t u = 1;
+    if (nb > 40)
+        return 0;
+    if (nb > 32)
+        u = (u << (nb - 32)) | rcd_bits(r, nb - 32);
+    u = (u << (nb > 32 ? 32 : nb)) | rcd_bits(r, nb > 32 ? 32 : nb);
+    u--;
+    return (u & 1u) ? -(int64_t)(u >> 1) - 1 : (int64_t)(u >> 1);
+}
+
+/* The pilot fields: full on keyframes (and after a gap), else as deltas. */
+typedef struct pilot_tx {
+    int have;
+    uint64_t next_base, base_prev;
+    uint32_t ph, amp;
+    int64_t wq;
+} pilot_tx_t;
+
+static void pilot_put(rc_enc_t *r, pilot_tx_t *t, int full, uint64_t base, size_t count,
+                      uint32_t ph, int64_t wq, uint32_t amp)
+{
+    full = full || !t->have || base != t->next_base;
+    rce_bits(r, (uint32_t)full, 1);
+    if (full) {
+        rce_bits(r, ph, 24);
+        put_eg(r, wq - wq_nominal());
+        rce_bits(r, amp, 16);
+    } else {
+        int32_t dph = (int32_t)((ph - ph_next(t->ph, t->wq, (size_t)(base - t->base_prev))) << 8) >> 8;
+        put_eg(r, dph);
+        put_eg(r, wq - t->wq);
+        put_eg(r, (int64_t)amp - (int64_t)t->amp);
+    }
+    t->have = 1;
+    t->ph = ph;
+    t->wq = wq;
+    t->amp = amp;
+    t->base_prev = base;
+    t->next_base = base + count;
+}
+
+static int pilot_get(rc_dec_t *r, pilot_tx_t *t, uint64_t base, size_t count,
+                     uint32_t *ph, int64_t *wq, uint32_t *amp)
+{
+    int full = (int)rcd_bits(r, 1);
+    if (full) {
+        *ph = rcd_bits(r, 24);
+        *wq = wq_nominal() + get_eg(r);
+        *amp = rcd_bits(r, 16);
+    } else {
+        if (!t->have || base != t->next_base)
+            return -1;
+        *ph = (ph_next(t->ph, t->wq, (size_t)(base - t->base_prev)) + (uint32_t)get_eg(r)) & 0xffffffu;
+        *wq = t->wq + get_eg(r);
+        *amp = (uint32_t)((int64_t)t->amp + get_eg(r));
+    }
+    t->have = 1;
+    t->ph = *ph;
+    t->wq = *wq;
+    t->amp = *amp;
+    t->base_prev = base;
+    t->next_base = base + count;
+    return r->err ? -1 : 0;
+}
+
+/* --- encoder -------------------------------------------------------------- */
 
 struct nanompx_comp_enc {
     nanompx_profile_t profile;
-    float *x;
-    float *work;
+    float *in[NBANDS];          /* band inputs: NF-1 samples of history, then the frame */
     size_t cap;
-    fir_state_t fir_mono;
-    fir_state_t fir_st;
-    fir_state_t fir_rds;
-    int phase_mono;
-    int phase_st;
-    int phase_rds;
-    float pred_mono;
-    float pred_st;
-    float pred_rds;
-    float pilot_amp;
-    float pilot_phase0;
-    int pilot_locked;
+    float *s2, *c3, *s3, *x;
+    float *ring[NBANDS];        /* decimated band samples */
+    band_models_t bm[NBANDS];
+    int models_ok;
+    /* pilot PLL: θ of the next frame's first sample and the frequency */
+    int pll_on;
+    uint64_t next_base;
+    uint32_t ph;
+    int64_t wq;
+    pilot_tx_t tx;
+    /* rate cap: bits over budget, and how far the quality is eased (dB) */
+    double debt;
+    float ease;
 };
 
-struct nanompx_comp_dec {
-    float *work;
-    size_t cap;
-    fir_state_t fir_mono_i;
-    fir_state_t fir_st_i;
-    fir_state_t fir_rds_i;
-    int phase_mono;
-    int phase_st;
-    int phase_rds;
-    float pred_mono;
-    float pred_st;
-    float pred_rds;
-};
-
-typedef struct enc_snap {
-    fir_state_t fir_mono;
-    fir_state_t fir_st;
-    fir_state_t fir_rds;
-    int phase_mono;
-    int phase_st;
-    int phase_rds;
-    float pred_mono;
-    float pred_st;
-    float pred_rds;
-    float pilot_amp;
-    float pilot_phase0;
-    int pilot_locked;
-} enc_snap_t;
-
-static void enc_save(const nanompx_comp_enc_t *e, enc_snap_t *s)
-{
-    s->fir_mono = e->fir_mono;
-    s->fir_st = e->fir_st;
-    s->fir_rds = e->fir_rds;
-    s->phase_mono = e->phase_mono;
-    s->phase_st = e->phase_st;
-    s->phase_rds = e->phase_rds;
-    s->pred_mono = e->pred_mono;
-    s->pred_st = e->pred_st;
-    s->pred_rds = e->pred_rds;
-    s->pilot_amp = e->pilot_amp;
-    s->pilot_phase0 = e->pilot_phase0;
-    s->pilot_locked = e->pilot_locked;
-}
-
-static void enc_restore(nanompx_comp_enc_t *e, const enc_snap_t *s)
-{
-    e->fir_mono = s->fir_mono;
-    e->fir_st = s->fir_st;
-    e->fir_rds = s->fir_rds;
-    e->phase_mono = s->phase_mono;
-    e->phase_st = s->phase_st;
-    e->phase_rds = s->phase_rds;
-    e->pred_mono = s->pred_mono;
-    e->pred_st = s->pred_st;
-    e->pred_rds = s->pred_rds;
-    e->pilot_amp = s->pilot_amp;
-    e->pilot_phase0 = s->pilot_phase0;
-    e->pilot_locked = s->pilot_locked;
-}
-
-/* work layout for encoder: res, mix, filt, mono_d, st_d, rds_d, mono_u, st_u, rds_u */
 static int ensure_enc(nanompx_comp_enc_t *e, size_t n)
 {
-    size_t need = n * 9 + n / 2 + 64;
-    if (e->cap >= need)
+    int b;
+    if (e->cap >= n)
         return 0;
-    free(e->x);
-    e->x = (float *)malloc(sizeof(float) * (n + need));
-    if (!e->x) {
+    for (b = 0; b < NBANDS; b++) {
+        float *p = (float *)realloc(e->in[b], sizeof(float) * (NF - 1 + n));
+        if (!p)
+            return -1;
+        if (!e->cap)
+            memset(p, 0, sizeof(float) * (NF - 1));
+        e->in[b] = p;
+    }
+    free(e->s2);
+    e->s2 = (float *)malloc(sizeof(float) * n * 4);
+    if (!e->s2) {
         e->cap = 0;
         return -1;
     }
-    e->work = e->x + n;
-    e->cap = need;
-    return 0;
-}
-
-static int ensure_dec(nanompx_comp_dec_t *d, size_t n)
-{
-    size_t need = n * 6 + n / 2 + 64;
-    if (d->cap >= need)
-        return 0;
-    free(d->work);
-    d->work = (float *)malloc(sizeof(float) * need);
-    if (!d->work) {
-        d->cap = 0;
-        return -1;
-    }
-    d->cap = need;
+    e->c3 = e->s2 + n;
+    e->s3 = e->c3 + n;
+    e->x = e->s3 + n;
+    e->cap = n;
     return 0;
 }
 
 nanompx_comp_enc_t *nanompx_comp_enc_create(nanompx_profile_t profile)
 {
     nanompx_comp_enc_t *e = (nanompx_comp_enc_t *)calloc(1, sizeof(*e));
+    int b;
     if (!e)
         return NULL;
+    tables_init();
+    for (b = 0; b < NBANDS; b++) {
+        e->ring[b] = (float *)calloc(RING, sizeof(float));
+        if (!e->ring[b]) {
+            nanompx_comp_enc_destroy(e);
+            return NULL;
+        }
+    }
     if (profile < NANOMPX_PROFILE_L || profile > NANOMPX_PROFILE_S)
         profile = NANOMPX_PROFILE_L;
     e->profile = profile;
@@ -641,9 +934,14 @@ nanompx_comp_enc_t *nanompx_comp_enc_create(nanompx_profile_t profile)
 
 void nanompx_comp_enc_destroy(nanompx_comp_enc_t *e)
 {
+    int b;
     if (!e)
         return;
-    free(e->x);
+    for (b = 0; b < NBANDS; b++) {
+        free(e->in[b]);
+        free(e->ring[b]);
+    }
+    free(e->s2);
     free(e);
 }
 
@@ -655,32 +953,36 @@ int nanompx_comp_enc_set_profile(nanompx_comp_enc_t *e, nanompx_profile_t profil
     return NANOMPX_OK;
 }
 
-static void reset_enc_filters(nanompx_comp_enc_t *e)
-{
-    fir_reset(&e->fir_mono);
-    fir_reset(&e->fir_st);
-    fir_reset(&e->fir_rds);
-    e->phase_mono = e->phase_st = e->phase_rds = 0;
-    e->pred_mono = e->pred_st = e->pred_rds = 0.f;
-    e->pilot_amp = 0.f;
-    e->pilot_phase0 = 0.f;
-    e->pilot_locked = 0;
-}
-
-void nanompx_comp_dec_reset(nanompx_comp_dec_t *d)
-{
-    if (!d)
-        return;
-    fir_reset(&d->fir_mono_i);
-    fir_reset(&d->fir_st_i);
-    fir_reset(&d->fir_rds_i);
-    d->phase_mono = d->phase_st = d->phase_rds = 0;
-    d->pred_mono = d->pred_st = d->pred_rds = 0.f;
-}
-
 unsigned nanompx_comp_codec_delay_samples(void)
 {
     return (unsigned)CODEC_DELAY;
+}
+
+/* Pilot in x[0..n) against θ = phi + w·j: amplitude, and phase error ε for a
+ * pilot A·sin(θ + ε). Hann-weighted, which keeps the mono and stereo
+ * sidebands out of it. */
+static void pilot_measure(const float *x, size_t n, double phi, double w, double *amp,
+                          double *err)
+{
+    double s = sin(phi), c = cos(phi), ds = sin(w), dc = cos(w), zr = 0.0, zi = 0.0, t;
+    double ws = 0.0;
+    size_t j;
+    for (j = 0; j < n; j++) {
+        double hw = 0.5 - 0.5 * cos(2.0 * M_PI * ((double)j + 0.5) / (double)n);
+        zr += hw * x[j] * c;    /* x · e^{-jθ} */
+        zi -= hw * x[j] * s;
+        ws += hw;
+        t = s * dc + c * ds;
+        c = c * dc - s * ds;
+        s = t;
+    }
+    zr /= ws;
+    zi /= ws;
+    /* A·sin(θ+ε)·e^{-jθ} averages to (A/2)·e^{j(ε−π/2)} */
+    *amp = 2.0 * sqrt(zr * zr + zi * zi);
+    *err = atan2(zi, zr) + M_PI / 2.0;
+    if (*err > M_PI)
+        *err -= 2.0 * M_PI;
 }
 
 int nanompx_comp_encode(nanompx_comp_enc_t *e,
@@ -688,121 +990,239 @@ int nanompx_comp_encode(nanompx_comp_enc_t *e,
                         uint8_t *dst, size_t dst_cap, size_t *out_len,
                         int keyframe, uint64_t sample_base)
 {
+    quality_t ql = profile_quality(e ? e->profile : NANOMPX_PROFILE_L);
+    float ease = e ? e->ease : 0.f;
+    rc_enc_t rc;
+    double phi, wv, amp, err;
     size_t i;
-    profile_cfg_t cfg;
-    bitw_t w;
-    float peak = 0.f;
-    float pamp, pphase;
-    size_t hdr = 8;
-    float *res, *mix, *mono_d, *st_d, *rds_d;
-    size_t n_mono = 0, n_st = 0, n_rds = 0;
-    double w19;
-    enc_snap_t snap;
-    int rc = NANOMPX_OK;
+    int b;
 
     if (!e || !samples || !dst || !out_len || count == 0 || count > 65535)
         return NANOMPX_ERR_INVALID;
-    if (count < (size_t)DEC_RDS)
-        return NANOMPX_ERR_INVALID;
     if (ensure_enc(e, count) != 0)
         return NANOMPX_ERR_NOMEM;
-    if (dst_cap < hdr + 64)
+    if (dst_cap < HDR_BYTES + 32)
         return NANOMPX_ERR_OVERFLOW;
 
-    if (keyframe)
-        reset_enc_filters(e);
+    for (i = 0; i < count; i++)
+        e->x[i] = (float)samples[i] / 8388608.f;
 
-    enc_save(e, &snap);
-
-    cfg = profile_cfg(e->profile);
-    w19 = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
-
-    res = e->work;
-    mix = res + count;
-    mono_d = mix + count;
-    st_d = mono_d + (count / DEC_AUDIO + 8);
-    rds_d = st_d + (count / DEC_AUDIO + 8);
-
-    for (i = 0; i < count; i++) {
-        e->x[i] = pcm24_to_float(samples[i]);
-        {
-            float a = fabsf(e->x[i]);
-            if (a > peak)
-                peak = a;
-        }
+    /* Pilot: continue the loop, or acquire (start, or a gap in the input). */
+    if (!e->pll_on || sample_base != e->next_base) {
+        pilot_measure(e->x, count, 0.0, W19, &amp, &err);
+        e->ph = ph_of(err);
+        e->wq = wq_nominal();
+        e->pll_on = 1;
     }
-
-    if (!e->pilot_locked) {
-        fit_pilot(e->x, count, sample_base, &pamp, &pphase);
-        e->pilot_amp = pamp;
-        e->pilot_phase0 = pphase;
-        e->pilot_locked = 1;
-    } else {
-        pphase = e->pilot_phase0;
-        refine_pilot_amp(e->x, count, sample_base, pphase, &pamp);
-        e->pilot_amp = pamp;
-    }
-    pamp = e->pilot_amp;
-    pphase = e->pilot_phase0;
-    for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(sample_base + i) + (double)pphase;
-        float pilot = pamp * (float)sin(ph);
-        res[i] = e->x[i] - pilot;
-    }
-
-    fir_decimate(&e->fir_mono, fir_lp15, res, count, DEC_AUDIO, &e->phase_mono, mono_d, &n_mono);
-
-    for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(sample_base + i) + (double)pphase;
-        mix[i] = res[i] * 2.f * (float)sin(2.0 * ph);
-    }
-    fir_decimate(&e->fir_st, fir_lp15, mix, count, DEC_AUDIO, &e->phase_st, st_d, &n_st);
-
-    for (i = 0; i < count; i++) {
-        double ph = w19 * (double)(sample_base + i) + (double)pphase;
-        mix[i] = res[i] * 2.f * (float)sin(3.0 * ph);
-    }
-    fir_decimate(&e->fir_rds, fir_lp25, mix, count, DEC_RDS, &e->phase_rds, rds_d, &n_rds);
+    phi = ph_rad(e->ph);
+    wv = wq_rad(e->wq);
+    pilot_measure(e->x, count, phi, wv, &amp, &err);
 
     dst[0] = COMP_MAGIC;
     dst[1] = (uint8_t)e->profile;
     dst[2] = (uint8_t)(count & 0xff);
     dst[3] = (uint8_t)((count >> 8) & 0xff);
-    dst[4] = (uint8_t)((cfg.bits_mono << 4) | (cfg.bits_stereo & 0x0f));
-    dst[5] = (uint8_t)((cfg.bits_rds << 4) | (cfg.rice_mono & 0x0f));
+    rce_init(&rc, dst + HDR_BYTES, dst_cap - HDR_BYTES);
+    pilot_put(&rc, &e->tx, keyframe, sample_base, count, e->ph, e->wq, amp_q(amp));
     {
-        uint16_t pk = (uint16_t)lrintf(peak * 65535.f);
-        dst[6] = (uint8_t)(pk & 0xff);
-        dst[7] = (uint8_t)((pk >> 8) & 0xff);
+        /* The next frame's θ continues this one's; corrections are small steps. */
+        uint32_t next = ph_next(e->ph, e->wq, count);
+        if (amp >= PILOT_MIN) {
+            next = (next + (uint32_t)llround(PLL_KP * err / (2.0 * M_PI) * PH_ONE)) & 0xffffffu;
+            e->wq += llround(PLL_KI * err / (double)count / (2.0 * M_PI) * WQ_ONE);
+        }
+        e->ph = next;
+        e->next_base = sample_base + count;
     }
 
-    bitw_init(&w, dst + hdr, dst_cap - hdr);
-    if (bitw_put_f32(&w, pamp) || bitw_put_f32(&w, pphase) ||
-        bitw_put(&w, (uint32_t)cfg.rice_stereo, 4) || bitw_put(&w, (uint32_t)cfg.rice_rds, 4) ||
-        bitw_put(&w, (uint32_t)n_mono, 16) || bitw_put(&w, (uint32_t)n_st, 16) ||
-        bitw_put(&w, (uint32_t)n_rds, 16) ||
-        quantize_pred_rice(mono_d, n_mono, cfg.bits_mono, cfg.rice_mono, &w, &e->pred_mono) ||
-        quantize_pred_rice(st_d, n_st, cfg.bits_stereo, cfg.rice_stereo, &w, &e->pred_st) ||
-        quantize_pred_rice(rds_d, n_rds, cfg.bits_rds, cfg.rice_rds, &w, &e->pred_rds)) {
-        enc_restore(e, &snap);
+    /* Band inputs at 192 kHz, after their NF-1 samples of history. */
+    carriers(phi, wv, count, NULL, e->s2, e->c3, e->s3);
+    for (i = 0; i < count; i++) {
+        float x = e->x[i];
+        e->in[0][NF - 1 + i] = x;
+        e->in[1][NF - 1 + i] = 2.f * x * e->s2[i];
+        e->in[2][NF - 1 + i] = 2.f * x * e->c3[i];
+        e->in[3][NF - 1 + i] = -2.f * x * e->s3[i];
+    }
+
+    if (keyframe || !e->models_ok) {
+        for (b = 0; b < NBANDS; b++)
+            models_init(&e->bm[b]);
+        e->models_ok = 1;
+    }
+    /* Over the bitrate: noise allowed higher and closer to the signal;
+     * under it: lower and further. */
+    for (b = 0; b < 2; b++) {
+        ql.floor_db[b] += ease;
+        ql.rel_db[b] -= ease;
+        ql.smr_db[b] -= 0.3f * ease;
+    }
+
+    for (b = 0; b < NBANDS; b++) {
+        const float *h = band_h(b);
+        const mdct_plan_t *p = band_plan(b);
+        int dec = band_dec(b), H = band_hop(b);
+        int64_t m0 = mcount((int64_t)sample_base, dec);
+        int64_t m1 = mcount((int64_t)(sample_base + count), dec), m, j;
+        float *ring = e->ring[b];
+
+        /* decimated samples m·dec of this frame: y(n) = Σ h[k]·x(n−k) */
+        for (m = m0; m < m1; m++) {
+            const float *xp = e->in[b] + (size_t)(m * dec - (int64_t)sample_base);
+            float acc = 0.f;
+            int k;
+            for (k = 0; k < NF; k++)
+                acc += h[k] * xp[k];
+            ring[(uint64_t)m & (RING - 1)] = acc;
+        }
+        /* MDCT blocks that are complete now */
+        for (j = blocks_upto((int64_t)sample_base, b); j < blocks_upto((int64_t)(sample_base + count), b); j++) {
+            float xb[2 * H_MAX], X[H_MAX];
+            int k;
+#ifdef NANOMPX_STATS
+            size_t before = rc.pos;
+#endif
+            for (k = 0; k < 2 * H; k++)
+                xb[k] = ring[(uint64_t)(j * H + k) & (RING - 1)];
+            mdct_fwd(p, xb, X);
+            enc_block(&rc, &e->bm[b], b, X, ql);
+#ifdef NANOMPX_STATS
+            nanompx_stat_bytes[b] += rc.pos - before;
+#endif
+        }
+        memmove(e->in[b], e->in[b] + count, sizeof(float) * (NF - 1));
+    }
+    rce_finish(&rc);
+    if (rc.err)
         return NANOMPX_ERR_OVERFLOW;
+    *out_len = HDR_BYTES + rc.pos;
+    {
+        /* Rate: a leaky bucket of debt (over budget) or credit (under). */
+        double budget = profile_kbps(e->profile) * 1000.0 * (double)count /
+                        (double)NANOMPX_SAMPLE_RATE;
+        e->debt += 8.0 * (double)*out_len - budget;
+        if (e->debt < -RATE_TIGHT_MAX * RATE_DB_BITS)
+            e->debt = -RATE_TIGHT_MAX * RATE_DB_BITS;
+        if (e->debt > RATE_EASE_MAX * RATE_DB_BITS)
+            e->debt = RATE_EASE_MAX * RATE_DB_BITS;
+        e->ease = (float)(e->debt / RATE_DB_BITS);
     }
-
-    *out_len = hdr + bitw_bytes(&w);
-    return rc;
+    (void)ease;
+    return NANOMPX_OK;
 }
+
+/* --- decoder -------------------------------------------------------------- */
+
+typedef struct pframe {
+    uint64_t base;
+    size_t len;
+    double phi, w, a0, a1;
+} pframe_t;
+
+struct nanompx_comp_dec {
+    float *ring[NBANDS];        /* decoded band samples by index & (RING-1) */
+    band_models_t bm[NBANDS];
+    int models_ok;
+    pilot_tx_t tx;
+    pframe_t pf[PRING];         /* pilot parameters of the last frames */
+    unsigned npf, pf_head;
+    float *s1, *s2, *c3, *s3, *pa;
+    size_t ccap;
+};
 
 nanompx_comp_dec_t *nanompx_comp_dec_create(void)
 {
-    return (nanompx_comp_dec_t *)calloc(1, sizeof(nanompx_comp_dec_t));
+    nanompx_comp_dec_t *d = (nanompx_comp_dec_t *)calloc(1, sizeof(*d));
+    int b;
+    if (!d)
+        return NULL;
+    tables_init();
+    for (b = 0; b < NBANDS; b++) {
+        d->ring[b] = (float *)calloc(RING, sizeof(float));
+        if (!d->ring[b]) {
+            nanompx_comp_dec_destroy(d);
+            return NULL;
+        }
+    }
+    return d;
 }
 
 void nanompx_comp_dec_destroy(nanompx_comp_dec_t *d)
 {
+    int b;
     if (!d)
         return;
-    free(d->work);
+    for (b = 0; b < NBANDS; b++)
+        free(d->ring[b]);
+    free(d->s1);
     free(d);
+}
+
+void nanompx_comp_dec_reset(nanompx_comp_dec_t *d)
+{
+    int b;
+    if (!d)
+        return;
+    for (b = 0; b < NBANDS; b++)
+        if (d->ring[b])
+            memset(d->ring[b], 0, RING * sizeof(float));
+    d->models_ok = 0;
+    d->tx.have = 0;
+    d->npf = 0;
+    d->pf_head = 0;
+}
+
+static const pframe_t *pf_get(const nanompx_comp_dec_t *d, unsigned age)
+{
+    return &d->pf[(d->pf_head + PRING - 1 - age) % PRING];
+}
+
+/* Pilot parameters for sample t: the newest frame starting at or before t
+ * (the oldest kept, extrapolated back, for earlier t); *until is where the
+ * next kept frame starts. */
+static const pframe_t *pf_at(const nanompx_comp_dec_t *d, int64_t t, int64_t *until)
+{
+    const pframe_t *p = NULL;
+    unsigned i;
+    *until = INT64_MAX;
+    for (i = 0; i < d->npf; i++) {
+        p = pf_get(d, i);
+        if ((int64_t)p->base <= t)
+            break;
+        *until = (int64_t)p->base;
+    }
+    return p;
+}
+
+static int ensure_dec(nanompx_comp_dec_t *d, size_t count)
+{
+    if (d->ccap < count) {
+        free(d->s1);
+        d->s1 = (float *)malloc(sizeof(float) * count * 5);
+        if (!d->s1) {
+            d->ccap = 0;
+            return -1;
+        }
+        d->s2 = d->s1 + count;
+        d->c3 = d->s2 + count;
+        d->s3 = d->c3 + count;
+        d->pa = d->s3 + count;
+        d->ccap = count;
+    }
+    return 0;
+}
+
+/* Band b at 192 kHz sample n: its decimated samples, zero-stuffed, through h. */
+static float synth(const nanompx_comp_dec_t *d, int b, int64_t n)
+{
+    int dec = band_dec(b);
+    const float *h = band_h(b), *v = d->ring[b];
+    int64_t m = fdiv(n, dec);
+    int k = (int)(n - m * dec);
+    float acc = 0.f;
+    for (; k < NF; k += dec, m--)
+        acc += h[k] * v[(uint64_t)m & (RING - 1)];
+    return acc * (float)dec;
 }
 
 int nanompx_comp_decode(nanompx_comp_dec_t *d,
@@ -811,92 +1231,104 @@ int nanompx_comp_decode(nanompx_comp_dec_t *d,
                         int32_t *samples, size_t max_samples, size_t *out_count,
                         int keyframe, uint64_t sample_base)
 {
-    size_t count;
-    bitr_t r;
-    float peak, pamp, pphase;
-    size_t i;
-    int bits_mono, bits_stereo, bits_rds, rice_mono, rice_stereo, rice_rds;
-    uint32_t tmp;
-    size_t n_mono, n_st, n_rds;
-    float *mono_d, *st_d, *rds_d, *mono_u, *st_u, *rds_u;
-    double w19;
+    size_t count, i;
+    rc_dec_t rc;
+    pframe_t *pf;
+    int b;
 
     (void)profile;
-    if (!d || !src || !samples || !out_count || src_len < 8)
+    if (!d || !src || !samples || !out_count || src_len < HDR_BYTES)
         return NANOMPX_ERR_INVALID;
     if (src[0] != COMP_MAGIC)
         return NANOMPX_ERR_INVALID;
-
     count = (size_t)src[2] | ((size_t)src[3] << 8);
-    bits_mono = (src[4] >> 4) & 0x0f;
-    bits_stereo = src[4] & 0x0f;
-    bits_rds = (src[5] >> 4) & 0x0f;
-    rice_mono = src[5] & 0x0f;
-    peak = ((float)(src[6] | (src[7] << 8))) / 65535.f;
     if (count == 0 || count > max_samples)
-        return NANOMPX_ERR_INVALID;
-    if (bits_mono < 2 || bits_mono > 15 || bits_stereo < 2 || bits_stereo > 15 || bits_rds < 1 ||
-        bits_rds > 15)
         return NANOMPX_ERR_INVALID;
     if (ensure_dec(d, count) != 0)
         return NANOMPX_ERR_NOMEM;
+    if (keyframe || !d->models_ok) {
+        for (b = 0; b < NBANDS; b++)
+            models_init(&d->bm[b]);
+        d->models_ok = 1;
+    }
 
-    if (keyframe)
-        nanompx_comp_dec_reset(d);
-    w19 = 2.0 * M_PI * PILOT_HZ / (double)NANOMPX_SAMPLE_RATE;
-
-    mono_d = d->work;
-    st_d = mono_d + (count / DEC_AUDIO + 8);
-    rds_d = st_d + (count / DEC_AUDIO + 8);
-    mono_u = rds_d + (count / DEC_RDS + 8);
-    st_u = mono_u + count;
-    rds_u = st_u + count;
-
-    bitr_init(&r, src + 8, src_len - 8);
-    if (bitr_get_f32(&r, &pamp) || bitr_get_f32(&r, &pphase))
-        return NANOMPX_ERR_INVALID;
-    if (bitr_get_bits(&r, 4, &tmp))
-        return NANOMPX_ERR_INVALID;
-    rice_stereo = (int)tmp;
-    if (bitr_get_bits(&r, 4, &tmp))
-        return NANOMPX_ERR_INVALID;
-    rice_rds = (int)tmp;
-    if (bitr_get_bits(&r, 16, &tmp))
-        return NANOMPX_ERR_INVALID;
-    n_mono = tmp;
-    if (bitr_get_bits(&r, 16, &tmp))
-        return NANOMPX_ERR_INVALID;
-    n_st = tmp;
-    if (bitr_get_bits(&r, 16, &tmp))
-        return NANOMPX_ERR_INVALID;
-    n_rds = tmp;
-
-    if (n_mono > count / DEC_AUDIO + 8 || n_st > count / DEC_AUDIO + 8 ||
-        n_rds > count / DEC_RDS + 8)
+    rcd_init(&rc, src + HDR_BYTES, src_len - HDR_BYTES);
+    pf = &d->pf[d->pf_head];
+    pf->base = sample_base;
+    pf->len = count;
+    {
+        uint32_t ph, amp;
+        int64_t wq;
+        if (pilot_get(&rc, &d->tx, sample_base, count, &ph, &wq, &amp))
+            return NANOMPX_ERR_INVALID;
+        pf->phi = ph_rad(ph);
+        pf->w = wq_rad(wq);
+        pf->a1 = (double)amp * AMP_LSB;
+    }
+    pf->a0 = pf->a1;
+    if (d->npf) {
+        const pframe_t *pp = pf_get(d, 0);
+        if (pp->base + pp->len == sample_base)
+            pf->a0 = pp->a1;     /* ramp from where the last frame ended */
+    }
+    if (rc.err)
         return NANOMPX_ERR_INVALID;
 
-    if (dequantize_pred_rice(mono_d, n_mono, bits_mono, rice_mono, &r, &d->pred_mono) ||
-        dequantize_pred_rice(st_d, n_st, bits_stereo, rice_stereo, &r, &d->pred_st) ||
-        dequantize_pred_rice(rds_d, n_rds, bits_rds, rice_rds, &r, &d->pred_rds))
-        return NANOMPX_ERR_INVALID;
+    for (b = 0; b < NBANDS; b++) {
+        const mdct_plan_t *p = band_plan(b);
+        int H = band_hop(b);
+        float *ring = d->ring[b];
+        int64_t j;
 
-    upsample_fir(&d->fir_mono_i, fir_lp15, mono_d, n_mono, DEC_AUDIO, &d->phase_mono, mono_u,
-                 count);
-    upsample_fir(&d->fir_st_i, fir_lp15, st_d, n_st, DEC_AUDIO, &d->phase_st, st_u, count);
-    upsample_fir(&d->fir_rds_i, fir_lp25, rds_d, n_rds, DEC_RDS, &d->phase_rds, rds_u, count);
+        for (j = blocks_upto((int64_t)sample_base, b); j < blocks_upto((int64_t)(sample_base + count), b); j++) {
+            float X[H_MAX], y[2 * H_MAX];
+            int k;
+            if (dec_block(&rc, &d->bm[b], b, X))
+                return NANOMPX_ERR_INVALID;
+            mdct_inv(p, X, y);
+            /* block j covers [jH, jH+2H): the second half is new */
+            for (k = H; k < 2 * H; k++)
+                ring[(uint64_t)(j * H + k) & (RING - 1)] = 0.f;
+            for (k = 0; k < 2 * H; k++)
+                ring[(uint64_t)(j * H + k) & (RING - 1)] += y[k];
+        }
+    }
+    d->pf_head = (d->pf_head + 1) % PRING;
+    if (d->npf < PRING)
+        d->npf++;
+
+    /* Carriers and pilot at t = n − delay, a segment per frame of parameters. */
+    for (i = 0; i < count;) {
+        int64_t t = (int64_t)(sample_base + i) - CODEC_DELAY;
+        int64_t end = (int64_t)(sample_base + count) - CODEC_DELAY, until;
+        const pframe_t *p = pf_at(d, t, &until);
+        double off = (double)(t - (int64_t)p->base);
+        size_t len, j;
+
+        if (until < end)
+            end = until;
+        len = (size_t)(end - t);
+        carriers(p->phi + p->w * off, p->w, len, d->s1 + i, d->s2 + i, d->c3 + i, d->s3 + i);
+        for (j = 0; j < len; j++) {
+            double f = (off + (double)j) / (double)p->len;
+            if (f < 0.0)
+                f = 0.0;
+            if (f > 1.0)
+                f = 1.0;
+            d->pa[i + j] = (float)(p->a0 + (p->a1 - p->a0) * f);
+        }
+        i += len;
+    }
 
     for (i = 0; i < count; i++) {
-        int64_t ti = (int64_t)sample_base + (int64_t)i - (int64_t)CODEC_DELAY;
-        double ph = w19 * (double)ti + (double)pphase;
-        float y = mono_u[i] + st_u[i] * (float)sin(2.0 * ph) + rds_u[i] * (float)sin(3.0 * ph) +
-                  pamp * (float)sin(ph);
-        if (peak > 0.f) {
-            if (y > peak)
-                y = peak;
-            if (y < -peak)
-                y = -peak;
-        }
-        samples[i] = float_to_pcm24(y);
+        int64_t n = (int64_t)(sample_base + i) - D_EXTRA;
+        float y = synth(d, 0, n) + synth(d, 1, n) * d->s2[i] + synth(d, 2, n) * d->c3[i] -
+                  synth(d, 3, n) * d->s3[i] + d->pa[i] * d->s1[i];
+        if (y > 1.f)
+            y = 1.f;
+        if (y < -1.f)
+            y = -1.f;
+        samples[i] = (int32_t)lrintf(y * 8388607.f);
     }
     *out_count = count;
     return NANOMPX_OK;

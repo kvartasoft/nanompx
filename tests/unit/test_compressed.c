@@ -48,7 +48,7 @@ static double snr_db(double sig, double err)
 static int test_profile(nanompx_profile_t profile, const char *name,
                         double min_mono_db, double min_stereo_db, double min_weighted_db)
 {
-    const unsigned n = NANOMPX_DEFAULT_FRAME_SAMPLES * 4;
+    const unsigned n = NANOMPX_DEFAULT_FRAME_SAMPLES * 60;
     int32_t *in;
     int32_t *out;
     uint8_t *pkt;
@@ -132,22 +132,9 @@ static int test_profile(nanompx_profile_t profile, const char *name,
         raw_sig += xin[i] * xin[i];
     }
 
-    /* Codec has ~2×FIR group delay; align before SNR (fair vs MicroMPX-style checks). */
+    /* Align by the codec's own delay (pure tones make correlation ambiguous). */
     {
-        unsigned best_lag = 0;
-        double best_c = -1e300;
-        unsigned lag;
-        unsigned max_lag = 256;
-        for (lag = 0; lag <= max_lag; lag++) {
-            double c = 0.0;
-            unsigned j;
-            for (j = 0; j + lag < n; j++)
-                c += xin[j] * xout[j + lag];
-            if (c > best_c) {
-                best_c = c;
-                best_lag = lag;
-            }
-        }
+        unsigned best_lag = nanompx_compressed_delay_samples();
         for (i = 0; i + best_lag < n; i++)
             err[i] = xout[i + best_lag] - xin[i];
         for (; i < n; i++)
@@ -160,7 +147,7 @@ static int test_profile(nanompx_profile_t profile, const char *name,
 
     /* Skip settle + use aligned error */
     {
-        unsigned skip = NANOMPX_SAMPLE_RATE / 500;
+        unsigned skip = NANOMPX_SAMPLE_RATE / 10;   /* rate control settles */
         unsigned m = n - skip;
         if (m > 256)
             m -= 128;
@@ -215,11 +202,11 @@ int main(void)
     /* Gates are band-weighted (fairer than flat MPX waveform SNR). */
     /* Gates reflect band-weighted FM quality (not flat MPX SNR).
      * Filterbank PR ceilings ~40 dB on synthetic MPX; profiles allocate bits. */
-    if (test_profile(NANOMPX_PROFILE_L, "L", 38.0, 30.0, 36.0))
+    if (test_profile(NANOMPX_PROFILE_L, "L", 55.0, 50.0, 50.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_M, "M", 30.0, 24.0, 28.0))
+    if (test_profile(NANOMPX_PROFILE_M, "M", 50.0, 45.0, 45.0))
         return 1;
-    if (test_profile(NANOMPX_PROFILE_S, "S", 22.0, 16.0, 20.0))
+    if (test_profile(NANOMPX_PROFILE_S, "S", 40.0, 36.0, 36.0))
         return 1;
     printf("Compressed L/M/S OK (FM band metrics)\n");
     return 0;
