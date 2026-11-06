@@ -10,9 +10,6 @@ GPS/1PPS SFN synchronization.
 - Modes: **PCM** (reference quality) and **COMPRESSED**, 128–1024 kbps
 - Protocol: open — see [docs/PROTOCOL.md](docs/PROTOCOL.md)
 
-NanoMPX is inspired by the problem space of products like MicroMPX, but it is an
-**independent** open protocol and implementation (not interoperable with Thimeo MicroMPX).
-
 ## Project / attribution
 
 NanoMPX is developed by **[Kvarta](https://www.kvarta.net)**. Most of the code in this
